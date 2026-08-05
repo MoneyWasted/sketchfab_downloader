@@ -13,7 +13,7 @@ const zlib = require('zlib');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const STATIC_KEY = "77d92dd656ac3fdde472d5ba59747f42ac0ce217";
+const STATIC_KEY = "7d61ef7c7530c12cf080fafd05e603d1aa3a92c6";
 let WORK_DIR = path.join(__dirname, '.cache');
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -207,12 +207,17 @@ async function extractStaticKey(embedHtml) {
         (embedHtml.match(/https:\/\/static\.sketchfab\.com\/static\/builds\/web\/dist\/[^"&]+\.js/g) || [])
     )];
 
+    // The static key is a 40-char hex SHA-1 exported from a small webpack module.
+    // Modern builds store it as: t.exports="<40hex>\n"
+    // Older builds used: exports.k = () => ...; const x = "<40hex>\n"
     for (const url of bundleUrls) {
         const js = (await fetch(url)).toString('utf8');
-        const match = js.match(/exports\s*\.\s*k\s*:\s*\(\)\s*=>\s*\w+\}\s*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})\\n"/);
+        const match = js.match(/t\.exports\s*=\s*"([0-9a-f]{40})\\n"/);
         if (match) return match[1];
-        const match2 = js.match(/\{k:\s*\(\)\s*=>\s*\w+\}[^;]*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})/);
+        const match2 = js.match(/exports\s*\.\s*k\s*:\s*\(\)\s*=>\s*\w+\}\s*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})\\n"/);
         if (match2) return match2[1];
+        const match3 = js.match(/\{k:\s*\(\)\s*=>\s*\w+\}[^;]*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})/);
+        if (match3) return match3[1];
     }
 
     return STATIC_KEY; // fallback to hardcoded

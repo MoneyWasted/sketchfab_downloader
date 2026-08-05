@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const STATIC_KEY = "77d92dd656ac3fdde472d5ba59747f42ac0ce217";
+const STATIC_KEY = "7d61ef7c7530c12cf080fafd05e603d1aa3a92c6";
 
 function parseWasmDataSize(wasmBytes) {
     let m = 65536;

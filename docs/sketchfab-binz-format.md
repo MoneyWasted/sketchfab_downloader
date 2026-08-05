@@ -172,7 +172,7 @@ The exported function `y(encryptedArrayBuffer, diterB, diterV, diterD, callback)
 
 ```javascript
 // Static key from module "pXZ0"
-const STATIC_KEY = "77d92dd656ac3fdde472d5ba59747f42ac0ce217";
+const STATIC_KEY = "7d61ef7c7530c12cf080fafd05e603d1aa3a92c6";
 
 // 1. Generate random seed
 var seed = parseInt(1314 + Math.floor(9999 * Math.random()));
