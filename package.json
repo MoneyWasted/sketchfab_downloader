@@ -20,7 +20,7 @@
   "dependencies": {
     "node-addon-api": "^8.9.0",
     "node-gyp": "^13.0.1",
-    "sharp": "^0.34.5"
+    "sharp": "^0.35.3"
   },
   "devDependencies": {
     "gltf-validator": "^2.0.0-dev.3.10",
