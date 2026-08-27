@@ -15,7 +15,8 @@ import {
 import {
 	join
 } from 'path';
-import {
+import _decoders from './decoders.js';
+const {
 	decodeVarint,
 	deltaDecode,
 	dequantize,
@@ -29,7 +30,7 @@ import {
 	readBuf,
 	buildUidMap,
 	resolveRefs
-} from './decoders';
+} = _decoders;
 
 // ─── GLB / glTF named constants ───────────────────────────────────────────────
 
@@ -69,27 +70,25 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, workDir) {
 	const geometries = [];
 	const seen = new Set();
 
-	function processGeom(geom) {
-		// Collect UserDataContainer values into a flat meta object.
-		const meta = {};
-		if (geom.UserDataContainer && geom.UserDataContainer.Values) {
-			for (const v of geom.UserDataContainer.Values) {
-				meta[v.Name] = isNaN(Number(v.Value)) ? v.Value : Number(v.Value);
-			}
-		}
+	// Resolve which binary buffer (poly vs. wireframe) a descriptor's File field
+	// refers to. Returns null when the required buffer was not provided.
+	const resolveBin = (fileStr) => fileStr && fileStr.includes('wireframe') ? wireBin : polyBin;
 
-		let stripIndices = null;
-		const triChunks = [];
+	// Decode the PrimitiveSetList of a geometry into a flat triangle index buffer.
+	// Returns { triChunks, stripIndices } so processGeom can remain focused on
+	// attribute processing and material resolution.
+	function processPrimitives(primitiveSetList, meta) {
+		const triangleMode = meta.triangle_mode || 0;
+		const hasTriAttr = (meta.attributes || 0) & 16;
 		// The "expected"/high-watermark counter is shared across all of a
 		// geometry's primitives and processed in list order: the strip advances
 		// it, then the loose-triangle set continues from the same value. Using a
 		// fresh counter per primitive corrupts the loose-triangle indices.
 		const expState = [0];
-		const triangleMode = meta.triangle_mode || 0;
-		const attrFlags = (meta.attributes || 0);
-		const hasTriAttr = attrFlags & 16;
+		let stripIndices = null;
+		const triChunks = [];
 
-		for (const prim of (geom.PrimitiveSetList || [])) {
+		for (const prim of (primitiveSetList || [])) {
 			const drawType = Object.keys(prim)[0];
 			const draw = prim[drawType];
 			if (!draw.Indices) continue;
@@ -98,7 +97,7 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, workDir) {
 			const indexArrayWrapper = draw.Indices.Array;
 			const arrayTypeName = Object.keys(indexArrayWrapper)[0];
 			const arrayDescriptor = indexArrayWrapper[arrayTypeName];
-			const bin = arrayDescriptor.File && arrayDescriptor.File.includes('wireframe') ? wireBin : polyBin;
+			const bin = resolveBin(arrayDescriptor.File);
 			if (!bin) continue;
 
 			const isStrip = draw.Mode === 'TRIANGLE_STRIP';
@@ -132,6 +131,27 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, workDir) {
 			} else triChunks.push(looseToTris(out));
 		}
 
+		return {
+			triChunks,
+			stripIndices
+		};
+	}
+
+	function processGeom(geom) {
+		// Collect UserDataContainer values into a flat meta object.
+		const meta = {};
+		if (geom.UserDataContainer && geom.UserDataContainer.Values) {
+			for (const v of geom.UserDataContainer.Values) {
+				meta[v.Name] = isNaN(Number(v.Value)) ? v.Value : Number(v.Value);
+			}
+		}
+
+		const attrFlags = (meta.attributes || 0);
+		const {
+			triChunks,
+			stripIndices
+		} = processPrimitives(geom.PrimitiveSetList, meta);
+
 		let totalIndexCount = 0;
 		for (const chunk of triChunks) totalIndexCount += chunk.length;
 		if (!totalIndexCount) return null;
@@ -143,6 +163,78 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, workDir) {
 			writeOffset += chunk.length;
 		}
 
+		// Attribute handlers keyed by exact name. Each receives the raw typed
+		// data, itemSize, and vertex count and returns { key, attr } to store in
+		// attrs, or null to skip. TexCoord* is handled separately below because
+		// its key is dynamic (prefix match, not exact).
+		const vertexMode = meta.vertex_mode || 0;
+		const attrHandlers = {
+			Vertex(data, itemSize, count) {
+				if ((vertexMode & 2) && stripIndices) parallelogramPredict(data, itemSize, stripIndices);
+				const pfx = 'vtx_';
+				if (meta[pfx + 'bbl_x'] !== undefined) {
+					const bbl = [meta[pfx + 'bbl_x'], meta[pfx + 'bbl_y']];
+					const h = [meta[pfx + 'h_x'], meta[pfx + 'h_y']];
+					if (itemSize === 3) {
+						bbl.push(meta[pfx + 'bbl_z']);
+						h.push(meta[pfx + 'h_z']);
+					}
+					data = dequantize(data, new Float32Array(data.length), bbl, h, itemSize);
+				}
+				return {
+					key: 'POSITION',
+					attr: {
+						data,
+						itemSize,
+						count
+					}
+				};
+			},
+			Normal(data, _itemSize, count) {
+				if (!(attrFlags & 2)) return null;
+				return {
+					key: 'NORMAL',
+					attr: {
+						data: decodeNormals(data, new Float32Array(count * 3), 3, meta.epsilon, meta.nphi),
+						itemSize: 3,
+						count
+					}
+				};
+			},
+			Tangent(data, _itemSize, count) {
+				if (!(attrFlags & 32)) return null;
+				return {
+					key: 'TANGENT',
+					attr: {
+						data: decodeNormals(data, new Float32Array(count * 4), 4, meta.epsilon, meta.nphi),
+						itemSize: 4,
+						count
+					}
+				};
+			},
+			Color(data, itemSize, count) {
+				if (data instanceof Uint8Array)
+					return {
+						key: 'COLOR_0',
+						attr: {
+							data,
+							itemSize: itemSize || 4,
+							count,
+							normalized: true,
+							componentType: GLTF_COMPONENT_UBYTE
+						}
+					};
+				return {
+					key: 'COLOR_0',
+					attr: {
+						data: new Float32Array(data),
+						itemSize: itemSize || 4,
+						count
+					}
+				};
+			},
+		};
+
 		const attrs = {};
 		const vaList = geom.VertexAttributeList || {};
 		for (const [name, def] of Object.entries(vaList)) {
@@ -150,7 +242,7 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, workDir) {
 			if (!arrayInfo) continue;
 			const typeName = Object.keys(arrayInfo)[0];
 			const arrayDef = arrayInfo[typeName];
-			const bin = arrayDef.File && arrayDef.File.includes('wireframe') ? wireBin : polyBin;
+			const bin = resolveBin(arrayDef.File);
 			if (!bin) continue;
 			const itemSize = def.ItemSize || 1;
 			let data = readBuf(bin.buffer, {
@@ -158,41 +250,15 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, workDir) {
 				ItemSize: itemSize
 			}, itemSize, typeName);
 			const count = arrayDef.Size;
-			const vertexMode = meta.vertex_mode || 0;
 
-			if (name === 'Vertex') {
-				if ((vertexMode & 2) && stripIndices) parallelogramPredict(data, itemSize, stripIndices);
-				const uvPrefix = 'vtx_';
-				if (meta[uvPrefix + 'bbl_x'] !== undefined) {
-					const bbl = [meta[uvPrefix + 'bbl_x'], meta[uvPrefix + 'bbl_y']];
-					const h = [meta[uvPrefix + 'h_x'], meta[uvPrefix + 'h_y']];
-					if (itemSize === 3) {
-						bbl.push(meta[uvPrefix + 'bbl_z']);
-						h.push(meta[uvPrefix + 'h_z']);
-					}
-					data = dequantize(data, new Float32Array(data.length), bbl, h, itemSize);
-				}
-				attrs.POSITION = {
-					data,
-					itemSize,
-					count
-				};
-			} else if (name === 'Normal' && (attrFlags & 2)) {
-				attrs.NORMAL = {
-					data: decodeNormals(data, new Float32Array(count * 3), 3, meta.epsilon, meta.nphi),
-					itemSize: 3,
-					count
-				};
-			} else if (name === 'Tangent' && (attrFlags & 32)) {
-				attrs.TANGENT = {
-					data: decodeNormals(data, new Float32Array(count * 4), 4, meta.epsilon, meta.nphi),
-					itemSize: 4,
-					count
-				};
+			const handler = attrHandlers[name];
+			if (handler) {
+				const result = handler(data, itemSize, count);
+				if (result) attrs[result.key] = result.attr;
 			} else if (name.startsWith('TexCoord')) {
 				const uvSuffix = name.replace('TexCoord', '');
 				const uvPrefix = `uv_${uvSuffix}_`;
-				const uvMode = meta[`uv_${uvSuffix}_mode`] !== undefined ? meta[`uv_${uvSuffix}_mode`] : (meta.vertex_mode || 0);
+				const uvMode = meta[`uv_${uvSuffix}_mode`] !== undefined ? meta[`uv_${uvSuffix}_mode`] : vertexMode;
 				if ((uvMode & 2) && stripIndices) parallelogramPredict(data, itemSize, stripIndices);
 				if (meta[uvPrefix + 'bbl_x'] !== undefined) {
 					const bbl = [meta[uvPrefix + 'bbl_x'], meta[uvPrefix + 'bbl_y']];
@@ -207,22 +273,6 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, workDir) {
 					itemSize: itemSize || 2,
 					count
 				};
-			} else if (name === 'Color') {
-				if (data instanceof Uint8Array) {
-					attrs.COLOR_0 = {
-						data,
-						itemSize: itemSize || 4,
-						count,
-						normalized: true,
-						componentType: GLTF_COMPONENT_UBYTE
-					};
-				} else {
-					attrs.COLOR_0 = {
-						data: new Float32Array(data),
-						itemSize: itemSize || 4,
-						count
-					};
-				}
 			}
 		}
 
@@ -442,46 +492,48 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, workDir) {
 				roughnessFactor: 1
 			}
 		};
-		if (chans) {
-			const albedo = chans.AlbedoPBR;
-			if (albedo) {
-				const i = addTextureCached(albedo.cleanFile || albedo.filename);
-				if (i >= 0) mat.pbrMetallicRoughness.baseColorTexture = {
+		const {
+			AlbedoPBR: albedo,
+			MetalRough: mr,
+			MetalnessPBR,
+			NormalMap: norm,
+			EmitColor: emit
+		} = chans ?? {};
+		if (albedo) {
+			const i = addTextureCached(albedo.cleanFile || albedo.filename);
+			if (i >= 0) mat.pbrMetallicRoughness.baseColorTexture = {
+				index: i
+			};
+		}
+		if (mr) {
+			const i = addTextureCached(mr.cleanFile);
+			if (i >= 0) mat.pbrMetallicRoughness.metallicRoughnessTexture = {
+				index: i
+			};
+		} else if (MetalnessPBR) {
+			const i = addTextureCached(MetalnessPBR.cleanFile || MetalnessPBR.filename);
+			if (i >= 0) mat.pbrMetallicRoughness.metallicRoughnessTexture = {
+				index: i
+			};
+		}
+		if (norm) {
+			const i = addTextureCached(norm.cleanFile || norm.filename);
+			if (i >= 0) mat.normalTexture = {
+				index: i,
+				scale: 1
+			};
+		}
+		if (emit) {
+			const i = addTextureCached(emit.cleanFile || emit.filename);
+			if (i >= 0) {
+				mat.emissiveTexture = {
 					index: i
 				};
-			}
-			const mr = chans.MetalRough;
-			if (mr) {
-				const i = addTextureCached(mr.cleanFile);
-				if (i >= 0) mat.pbrMetallicRoughness.metallicRoughnessTexture = {
-					index: i
-				};
-			} else if (chans.MetalnessPBR) {
-				const i = addTextureCached(chans.MetalnessPBR.cleanFile || chans.MetalnessPBR.filename);
-				if (i >= 0) mat.pbrMetallicRoughness.metallicRoughnessTexture = {
-					index: i
-				};
-			}
-			const norm = chans.NormalMap;
-			if (norm) {
-				const i = addTextureCached(norm.cleanFile || norm.filename);
-				if (i >= 0) mat.normalTexture = {
-					index: i,
-					scale: 1
-				};
-			}
-			const emit = chans.EmitColor;
-			if (emit) {
-				const i = addTextureCached(emit.cleanFile || emit.filename);
-				if (i >= 0) {
-					mat.emissiveTexture = {
-						index: i
-					};
-					mat.emissiveFactor = [1, 1, 1];
-				}
+				mat.emissiveFactor = [1, 1, 1];
 			}
 		}
-		return gltf.materials.push(mat) - 1;
+		gltf.materials.push(mat);
+		return gltf.materials.length - 1;
 	}
 
 	// materialsClean maps material name → channels. Match each geometry to its

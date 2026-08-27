@@ -16,25 +16,31 @@ import {
 import {
 	join
 } from 'path';
-import {
+import _network from './src/network.js';
+const {
 	fetch
-} from './src/network';
-import {
+} = _network;
+import _wasm from './src/wasm.js';
+const {
 	decryptBinz
-} from './src/wasm';
-import {
+} = _wasm;
+import _config from './src/config.js';
+const {
 	getModelConfig,
 	ensureWasm,
 	extractStaticKey
-} from './src/config';
-import {
+} = _config;
+import _textures from './src/textures.js';
+const {
 	descrambleTextures
-} from './src/textures';
-import {
+} = _textures;
+import _gltf from './src/gltf.js';
+const {
 	convertToGltf
-} from './src/gltf';
+} = _gltf;
 
 // ─── Config ───────────────────────────────────────────────────────────────────
+const __dirname = import.meta.dirname;
 let WORK_DIR = join(__dirname, '.cache');
 
 // ─── Step 2: Download files ───────────────────────────────────────────────────

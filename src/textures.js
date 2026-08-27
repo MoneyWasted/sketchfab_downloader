@@ -12,8 +12,8 @@
  * See docs/sketchfab-binz-format.md for the full format description.
  */
 
-const fs = require('fs');
-const path = require('path');
+import fs from 'fs';
+import path from 'path';
 
 /** Tile dimension used by the scramble grid. */
 const BLOCK_SIZE = 8;
@@ -208,7 +208,9 @@ async function descrambleTextures(config, workDir) {
 	// Use sharp or jimp for image decode. Fall back to raw decode.
 	let decodeImage, encodeImage;
 	try {
-		const sharp = require('sharp');
+		const {
+			default: sharp
+		} = await import('sharp');
 		decodeImage = async (p) => {
 			const {
 				data,
@@ -305,7 +307,7 @@ async function descrambleTextures(config, workDir) {
 	return materialsClean;
 }
 
-module.exports = {
+export default {
 	descrambleTexture,
 	descrambleTextures
 };

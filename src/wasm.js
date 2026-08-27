@@ -61,11 +61,11 @@ const WASM_EXPORTS = {
 function parseWasmDataSize(wasmBytes) {
 	let initialMem = 65536;
 	let cursor = 8; // skip 4-byte magic + 4-byte version
+	const length = wasmBytes.length;
 
 	const readByte = () => wasmBytes[cursor++];
 	const readVaruint = () => {
-		let start = cursor,
-			value = 0,
+		let value = 0,
 			shift = 0,
 			byte_;
 		do {
@@ -77,12 +77,12 @@ function parseWasmDataSize(wasmBytes) {
 		return value;
 	};
 
-	while (cursor < wasmBytes.length) {
+	for (; cursor < length;) {
 		const sectionType = readVaruint();
 		const sectionSize = readVaruint();
 		const sectionEnd = cursor + sectionSize;
 
-		if (sectionType < 0 || sectionType > 11 || sectionSize <= 0 || sectionEnd > wasmBytes.length) break;
+		if (sectionType > 11 || sectionSize <= 0 || sectionEnd > length) break;
 
 		if (sectionType === 6) {
 			// Global section: read global count, then read each global's type byte,
@@ -99,17 +99,16 @@ function parseWasmDataSize(wasmBytes) {
 		if (sectionType === 11) {
 			// Data section: iterate segments to advance past their payload bytes.
 			const numSegments = readVaruint();
-			for (let segIndex = 0; segIndex !== numSegments && cursor < sectionEnd; segIndex++) {
+			for (let seg = 0; seg !== numSegments && cursor < sectionEnd; seg++) {
 				readVaruint(); // segment flags
 				readVaruint(); // init opcode
 				readVaruint(); // offset value
 				readByte(); // end opcode
-				const segDataLen = readVaruint();
-				cursor += segDataLen;
+				cursor += readVaruint(); // skip segment payload
 			}
 		}
 
-		cursor = sectionEnd;
+		cursor = sectionEnd; // enforce section boundary regardless of reads above
 	}
 
 	return initialMem;
@@ -130,21 +129,17 @@ async function initWasm(wasmPath) {
 		throw new Error('decrypt.wasm not found — run ensureWasm first');
 	}
 	const wasmBytes = readFileSync(wasmPath);
-	const r = new Uint8Array(wasmBytes);
-	const m = parseWasmDataSize(r);
-	const g = 262144 + ((m + 65535) >> 16 << 16);
-	let currentBreak = m;
+	const wasmU8 = new Uint8Array(wasmBytes);
+	const dataSize = parseWasmDataSize(wasmU8);
+	const initialPages = (262144 + ((dataSize + 65535) >> 16 << 16)) >> 16;
+	let currentBreak = dataSize;
 	const memory = new WebAssembly.Memory({
-		initial: g >> 16,
+		initial: initialPages,
 		maximum: 536870912 >> 16,
 		shared: false
 	});
 	let u8 = new Uint8Array(memory.buffer),
 		u32 = new Uint32Array(memory.buffer);
-	const refresh = () => {
-		u8 = new Uint8Array(memory.buffer);
-		u32 = new Uint32Array(memory.buffer);
-	};
 	const env = {
 		sbrk(inc) {
 			const old = currentBreak;
@@ -152,16 +147,15 @@ async function initWasm(wasmPath) {
 			const ov = currentBreak - memory.buffer.byteLength;
 			if (ov > 0) {
 				memory.grow((ov + 65535) >> 16);
-				refresh();
+				u8 = new Uint8Array(memory.buffer);
+				u32 = new Uint32Array(memory.buffer);
 			}
 			return old | 0;
 		},
 		time(t) {
-			const r = Date.now() / 1000 | 0;
-			if (t) {
-				u32[t >> 2] = r;
-				return r;
-			}
+			const now = Date.now() / 1000 | 0;
+			if (t) u32[t >> 2] = now;
+			return now;
 		},
 		gettimeofday(t) {
 			const n = Date.now();
@@ -171,10 +165,13 @@ async function initWasm(wasmPath) {
 		abort() {
 			throw new Error('WASM abort');
 		},
+		__lock() {},
+		__unlock() {},
+		setjmp() {},
+		__cxa_atexit() {},
 		memory
 	};
-	env.__lock = env.__unlock = env.setjmp = env.__cxa_atexit = () => {};
-	const result = await WebAssembly.instantiate(r, {
+	const result = await WebAssembly.instantiate(wasmU8, {
 		env
 	});
 	const ex = result.instance.exports;
@@ -183,12 +180,34 @@ async function initWasm(wasmPath) {
 	}
 	return {
 		exports: ex,
-		getMemory: () => {
-			refresh();
-			return u8;
-		},
+		getMemory: () => new Uint8Array(memory.buffer),
 		memory
 	};
+}
+
+/**
+ * Derives 10 key words from a 40-char hex key and a numeric seed.
+ *
+ * The key is split into 10 four-hex-digit chunks. Each chunk is XORed with
+ * the seed and an accumulating running XOR to produce the key material, then
+ * a final XOR mask is applied across all words.
+ *
+ * @param {string} keyHex - 40-char lowercase hex string.
+ * @param {number} seed   - Random seed value.
+ * @returns {number[]} Array of 10 derived key word values.
+ */
+function deriveKeyWords(keyHex, seed) {
+	const words = [];
+	let runningXor = seed;
+	for (let i = 0; i < 10; i++) {
+		const chunk = parseInt(keyHex.slice(4 * i, 4 * i + 4), 16);
+		runningXor ^= chunk;
+		words.push(chunk ^ seed);
+	}
+	// finalXor = last runningXor XORed with all 10 words
+	let finalXor = runningXor;
+	for (const w of words) finalXor ^= w;
+	return words.map(w => w ^ finalXor);
 }
 
 /**
@@ -217,45 +236,20 @@ async function decryptBinz(binzPath, diterB, staticKey, wasmPath) {
 	const getOutputStart = ex[WASM_EXPORTS.getOutputStart];
 
 	// ── Phase 1: Derive 10 key words from the static SHA-1 hex key ──────────
-	// The key is split into 10 four-hex-digit chunks. Each chunk is XORed with
-	// a random seed and an accumulating running XOR to produce the key material.
 	const keyHex = (staticKey || STATIC_KEY).slice(0, 40).toLowerCase();
 	const seed = 1314 + Math.floor(9999 * Math.random());
-	const collected = [];
-	let runningXor = seed;
-	for (let i = 0; i < 10; i++) {
-		const chunk = parseInt(keyHex.slice(4 * i, 4 * i + 4), 16);
-		runningXor ^= chunk;
-		collected.push(chunk ^ seed);
-		collected.push(runningXor);
-	}
+	const keyWords = deriveKeyWords(keyHex, seed);
 
-	// ── Phase 2: Compute a final XOR mask across the even-indexed words ──────
-	let finalXor = collected[19];
-	for (let i = 0; i < 10; i++) finalXor ^= collected[2 * i];
-	const keyWords = Array.from({
-		length: 10
-	}, (_, i) => collected[2 * i] ^ finalXor);
-
-	// ── Phase 3: Write each key word as a 4-char hex string into WASM memory ─
+	// ── Phase 2: Write each key word as a 4-char hex string into WASM memory ─
 	const keyOffset = setupKey(seed, 40);
-	let mem = wasm.getMemory();
-	for (let i = 0; i < 10; i++) {
-		let hexWord = keyWords[i].toString(16);
-		hexWord = "0".repeat(4 - hexWord.length) + hexWord;
-		for (let ci = 0; ci < hexWord.length; ci++) {
-			mem[keyOffset + ci + 4 * i] = hexWord.charCodeAt(ci);
-		}
-	}
+	const keyBuf = Buffer.from(keyWords.map(w => w.toString(16).padStart(4, '0')).join(''));
+	wasm.getMemory().set(keyBuf, keyOffset);
 
 	const diterBClean = diterB.replace(/\\n/g, '').replace(/\n/g, '');
 	const diterBBytes = Buffer.from(diterBClean, 'base64');
 	reset();
 	const dOff = allocDiterB(diterBBytes.length);
-	mem = wasm.getMemory();
-	for (let i = 0; i < diterBBytes.length; i++) {
-		mem[dOff + i] = diterBBytes[i];
-	}
+	wasm.getMemory().set(diterBBytes, dOff);
 	process_(0);
 
 	const input = new Uint8Array(encData);
@@ -263,16 +257,12 @@ async function decryptBinz(binzPath, diterB, staticKey, wasmPath) {
 	for (let off = 0; off < input.length; off += 10240) {
 		const len = Math.min(10240, input.length - off);
 		const iOff = allocInput(len);
-		mem = wasm.getMemory();
-		for (let i = 0; i < len; i++) {
-			mem[iOff + i] = input[off + i];
-		}
+		wasm.getMemory().set(input.subarray(off, off + len), iOff);
 		let more = process_(1);
 		while (more) {
-			mem = wasm.getMemory();
-			const s = getOutputStart(),
-				e = getOutputStart() + getOutputSize();
-			chunks.push(Buffer.from(mem.subarray(s, e).slice(0)));
+			const mem = wasm.getMemory();
+			const s = getOutputStart();
+			chunks.push(Buffer.from(mem.subarray(s, s + getOutputSize())));
 			advance();
 			more = process_(0);
 		}

@@ -2,6 +2,7 @@
   "name": "sketchfab-downloader",
   "version": "1.0.0",
   "description": "Download Sketchfab models as glTF: decrypt .binz, decode osgjs, descramble textures",
+  "type": "module",
   "main": "download.js",
   "bin": {
     "sketchfab-dl": "download.js"

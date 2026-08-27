@@ -5,13 +5,15 @@ import {
 	writeFileSync
 } from 'fs';
 import path from 'path';
-import {
+import _network from './network.js';
+const {
 	fetch,
 	fetchText
-} from './network';
-import {
+} = _network;
+import _wasm from './wasm.js';
+const {
 	STATIC_KEY
-} from './wasm';
+} = _wasm;
 
 /**
  * Fetch and parse the Sketchfab embed page for a model, returning all the
