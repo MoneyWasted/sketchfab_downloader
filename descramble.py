@@ -1,20 +1,83 @@
-"""Sketchfab texture descrambler. Reverses the GPU-based pixel permutation."""
+"""
+Python port of the Sketchfab GPU texture descramble fragment shader.
+
+The scramble algorithm is a pixel-permutation keyed on a per-texture ``pk``
+value that Sketchfab applies on the GPU before serving model textures.  This
+module reverses that permutation so the image can be read by standard tools.
+
+The core zigzag math (``triSum``, ``xyToZigzag``, ``zigzagToXy``,
+``pixelToFlat``, ``flatToPixel``) is a direct port of the GLSL fragment shader
+and is kept intentionally identical to the JavaScript implementation in
+``src/textures.js``.
+
+References:
+    - ``docs/sketchfab-binz-format.md`` — full format and algorithm description
+    - ``src/textures.js`` — shared JavaScript implementation of the same algorithm
+
+Usage::
+
+    python3 descramble.py <scrambled_image> <pk_value> [output_image]
+
+Arguments:
+    scrambled_image  Path to the scrambled PNG/JPEG produced by Sketchfab.
+    pk_value         Integer ``pk`` field from the osgjs image metadata.
+    output_image     Output file path (default: ``out_<scrambled_image>``).
+"""
+
+import math
+import sys
+import os
+
 import numpy as np
 from PIL import Image
-import sys, os
+
+# ---------------------------------------------------------------------------
+# Module-level constants — must match the GPU shader and src/textures.js
+# ---------------------------------------------------------------------------
+
+BLOCK_SIZE = 8        # Tile dimension for the scramble grid (matches GPU shader)
+ROTATION_COUNT = 4    # Number of intra-block rotation variants
+
+
+# ---------------------------------------------------------------------------
+# Low-level helpers
+# ---------------------------------------------------------------------------
 
 def mod(i, u):
+    """Return ``i`` modulo ``u`` using truncating (C-style) integer division."""
     y = i // u
     return i - y * u
 
+
 def min_(a, b):
+    """Return the smaller of two values."""
     return a if a < b else b
 
+
 def max_(a, b):
+    """Return the larger of two values."""
     return a if a > b else b
 
+
+# ---------------------------------------------------------------------------
+# Zigzag index math — direct port of the GPU fragment shader
+# ---------------------------------------------------------------------------
+
 def triangle_sum(y, t, f_):
-    """Partial triangle number sum for zigzag indexing."""
+    """Compute the partial triangle-number sum used for zigzag index offsets.
+
+    This is a helper for :func:`xy_to_zigzag` and :func:`zigzag_to_xy`.  It
+    counts how many cells come *before* diagonal ``f_`` in a ``y``-by-``t``
+    block laid out in zigzag order.
+
+    Args:
+        y:  Height (or width) of the block in tiles.
+        t:  Width (or height) of the block in tiles.
+        f_: Diagonal index (``pos[0] + pos[1]`` in the calling context).
+
+    Returns:
+        Integer offset of the first cell on diagonal ``f_``.
+    """
     x = min_(y, t)
     n = max_(y, t)
     if f_ < x:
@@ -24,8 +87,22 @@ def triangle_sum(y, t, f_):
     r = f_ - n
     return x * (x + 1) // 2 + x * (n - x) + (x - 1) * r - (r - 1) * r // 2
 
+
 def xy_to_zigzag(y, t, pos):
-    """Convert 2D block coordinate to zigzag index."""
+    """Convert a 2-D tile coordinate to its scalar zigzag index.
+
+    Mirrors the GLSL ``xyToZigzag`` function from the Sketchfab GPU shader.
+    The zigzag traversal walks diagonals of the tile grid so that spatially
+    nearby tiles end up at adjacent indices.
+
+    Args:
+        y:   Number of tile rows in the block grid.
+        t:   Number of tile columns in the block grid.
+        pos: ``(col, row)`` tuple — zero-based tile coordinate.
+
+    Returns:
+        Scalar zigzag index for the tile at ``pos``.
+    """
     r = min_(y, t)
     n = max_(y, t)
     v = pos[0] + pos[1]
@@ -47,9 +124,21 @@ def xy_to_zigzag(y, t, pos):
         return triangle_sum(y, t, v) + s
     return triangle_sum(y, t, v) + e - s - 1
 
+
 def zigzag_to_xy(y, t, x):
-    """Convert zigzag index back to 2D block coordinate."""
-    import math
+    """Convert a scalar zigzag index back to its 2-D tile coordinate.
+
+    Inverse of :func:`xy_to_zigzag`.  Mirrors the GLSL ``zigzagToXy``
+    function from the Sketchfab GPU shader.
+
+    Args:
+        y: Number of tile rows in the block grid.
+        t: Number of tile columns in the block grid.
+        x: Scalar zigzag index to invert.
+
+    Returns:
+        ``(col, row)`` tuple — zero-based tile coordinate.
+    """
     v = min_(y, t)
     r = max_(y, t)
     threshold1 = v * (v + 1) // 2
@@ -81,7 +170,6 @@ def zigzag_to_xy(y, t, x):
         return (e, g)
 
     n2 = v * (v - 1) // 2 - (x - threshold2) - 1
-    import math
     s2 = int((-1 + math.sqrt(8 * n2 + 1)) // 1) // 2
     n = r + v - s2 - 2
     h2 = x - triangle_sum(y, t, n)
@@ -92,63 +180,113 @@ def zigzag_to_xy(y, t, x):
     S2 = n + h2 - y + 1
     return (n - S2, S2)
 
+
 def pixel_to_block_index(vx, vy, block_w, block_h):
-    """Map pixel position to flat block+intra-block index."""
-    bx = vx // 8
-    by = vy // 8
+    """Map a pixel position to its flat scrambled index.
+
+    Divides the image into ``BLOCK_SIZE × BLOCK_SIZE`` tiles, assigns each
+    tile a zigzag index, then applies a rotation variant (one of
+    ``ROTATION_COUNT`` options) to the intra-tile pixel position before
+    computing the flat index.
+
+    Args:
+        vx:      Pixel x-coordinate (column).
+        vy:      Pixel y-coordinate (row).
+        block_w: Number of tiles across the image width (``image_w // BLOCK_SIZE``).
+        block_h: Number of tiles across the image height (``image_h // BLOCK_SIZE``).
+
+    Returns:
+        Flat scrambled index for the pixel at ``(vx, vy)``.
+    """
+    bx = vx // BLOCK_SIZE
+    by = vy // BLOCK_SIZE
     block_idx = xy_to_zigzag(block_w, block_h, (bx, by))
-    rotation = mod(block_idx, 4)
-    px = mod(vx, 8)
-    py = mod(vy, 8)
+    rotation = mod(block_idx, ROTATION_COUNT)
+    px = mod(vx, BLOCK_SIZE)
+    py = mod(vy, BLOCK_SIZE)
     if rotation == 1:
-        px = 7 - px
+        px = (BLOCK_SIZE - 1) - px
     elif rotation == 2:
         px, py = py, px
     elif rotation == 3:
-        px, py = 7 - py, px
-    return block_idx * 64 + px + py * 8
+        px, py = (BLOCK_SIZE - 1) - py, px
+    return block_idx * (BLOCK_SIZE * BLOCK_SIZE) + px + py * BLOCK_SIZE
+
 
 def flat_index_to_pixel(idx, w, h):
-    """Map flat descrambled index back to pixel position."""
+    """Map a flat descrambled index back to its pixel position.
+
+    Inverse of :func:`pixel_to_block_index`.  Recovers the ``(x, y)``
+    coordinates that a given flat index corresponds to in the original
+    unscrambled pixel grid.
+
+    Args:
+        idx: Flat index in the descrambled pixel sequence.
+        w:   Image width in pixels.
+        h:   Image height in pixels.
+
+    Returns:
+        ``(x, y)`` pixel coordinate tuple.
+    """
     total = w * h
     idx = mod(idx, total)
-    block_w = w // 8
-    block_h = h // 8
-    block_idx = idx // 64
-    intra = idx - block_idx * 64
-    intra_y = intra // 8
-    intra_x = intra - intra_y * 8
-    rotation = mod(block_idx, 4)
+    block_w = w // BLOCK_SIZE
+    block_h = h // BLOCK_SIZE
+    block_idx = idx // (BLOCK_SIZE * BLOCK_SIZE)
+    intra = idx - block_idx * (BLOCK_SIZE * BLOCK_SIZE)
+    intra_y = intra // BLOCK_SIZE
+    intra_x = intra - intra_y * BLOCK_SIZE
+    rotation = mod(block_idx, ROTATION_COUNT)
     bpos = zigzag_to_xy(block_w, block_h, block_idx)
-    px = bpos[0] * 8
-    py = bpos[1] * 8
+    px = bpos[0] * BLOCK_SIZE
+    py = bpos[1] * BLOCK_SIZE
     if rotation == 0:
         px += intra_x
         py += intra_y
     elif rotation == 1:
-        px += 7 - intra_x
+        px += (BLOCK_SIZE - 1) - intra_x
         py += intra_y
     elif rotation == 2:
         px += intra_y
         py += intra_x
     elif rotation == 3:
         px += intra_y
-        py += 7 - intra_x
+        py += (BLOCK_SIZE - 1) - intra_x
     return (px, py)
 
+
+# ---------------------------------------------------------------------------
+# Public descramble routines
+# ---------------------------------------------------------------------------
+
 def descramble_texture(img_array, pk):
-    """Descramble a Sketchfab texture using the pk parameter."""
+    """Descramble a Sketchfab texture using the ``pk`` parameter (reference implementation).
+
+    Reverses the GPU pixel-permutation by computing, for each output pixel,
+    which source pixel it should be copied from.  This is a straightforward
+    per-pixel loop and is intentionally easy to read; for large images prefer
+    :func:`descramble_fast`.
+
+    Args:
+        img_array: ``numpy`` array of shape ``(height, width, channels)`` or
+                   ``(height, width)`` containing the scrambled pixel data.
+        pk:        Integer ``pk`` value from the osgjs image metadata.
+
+    Returns:
+        A ``numpy`` array of the same shape and dtype as ``img_array`` with
+        pixels placed in their correct (unscrambled) positions.
+    """
     h, w = img_array.shape[:2]
     channels = img_array.shape[2] if len(img_array.shape) > 2 else 1
     total = w * h
-    offset = (-pk * 64) % total
+    offset = (-pk * (BLOCK_SIZE * BLOCK_SIZE)) % total
 
     result = np.zeros_like(img_array)
 
     for y in range(h):
         for x in range(w):
             # Forward: find where this output pixel comes from
-            flat_idx = pixel_to_block_index(x, y, w // 8, h // 8)
+            flat_idx = pixel_to_block_index(x, y, w // BLOCK_SIZE, h // BLOCK_SIZE)
             shifted = flat_idx + offset
             if shifted >= total:
                 shifted -= total
@@ -160,11 +298,30 @@ def descramble_texture(img_array, pk):
 
     return result
 
+
 def descramble_fast(img_array, pk):
-    """Vectorized descramble using precomputed lookup table."""
+    """Vectorized descramble using a precomputed lookup table.
+
+    Builds a full ``(height, width)`` index lookup table in a single Python
+    loop and then applies it with NumPy advanced indexing, which is
+    substantially faster than the per-pixel reference loop in
+    :func:`descramble_texture`.
+
+    The algorithm is identical to :func:`descramble_texture`; only the
+    execution strategy differs.
+
+    Args:
+        img_array: ``numpy`` array of shape ``(height, width, channels)``
+                   containing the scrambled pixel data.
+        pk:        Integer ``pk`` value from the osgjs image metadata.
+
+    Returns:
+        A ``numpy`` array of the same shape and dtype as ``img_array`` with
+        pixels placed in their correct (unscrambled) positions.
+    """
     h, w = img_array.shape[:2]
     total = w * h
-    offset = (-pk * 64) % total
+    offset = (-pk * (BLOCK_SIZE * BLOCK_SIZE)) % total
 
     # Build lookup: for each output pixel (x,y), find source pixel
     # This is the inverse of the scramble
@@ -173,7 +330,7 @@ def descramble_fast(img_array, pk):
 
     for y in range(h):
         for x in range(w):
-            flat_idx = pixel_to_block_index(x, y, w // 8, h // 8)
+            flat_idx = pixel_to_block_index(x, y, w // BLOCK_SIZE, h // BLOCK_SIZE)
             shifted = (flat_idx + offset) % total
             src = flat_index_to_pixel(shifted, w, h)
             lut_x[y, x] = src[0]
@@ -181,24 +338,50 @@ def descramble_fast(img_array, pk):
 
     return img_array[lut_y, lut_x]
 
-if __name__ == '__main__':
-    if len(sys.argv) < 4:
-        print("Usage: python descramble.py <input> <pk> <output>")
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    """Command-line entry point for descrambling a single Sketchfab texture.
+
+    Reads a scrambled image file, applies the descramble algorithm keyed on
+    the supplied ``pk`` value, and writes the result to disk.
+
+    Arguments (via ``sys.argv``):
+        1. ``input_path``  — Path to the scrambled PNG/JPEG.
+        2. ``pk``          — Integer ``pk`` field from the osgjs image metadata.
+        3. ``output_path`` — (Optional) Destination file path.
+                             Defaults to ``out_<input_filename>``.
+
+    Exits with status 1 if fewer than two positional arguments are supplied.
+    """
+    if len(sys.argv) < 3:
+        print("Usage: python3 descramble.py <input> <pk> [output]")
         print("  pk = the .pk value from the osgjs image metadata")
         sys.exit(1)
 
     input_path = sys.argv[1]
     pk = int(sys.argv[2])
-    output_path = sys.argv[3]
+    if len(sys.argv) >= 4:
+        output_path = sys.argv[3]
+    else:
+        base = os.path.basename(input_path)
+        output_path = os.path.join(os.path.dirname(input_path), "out_" + base)
 
     print(f"Loading {input_path}...")
     img = np.array(Image.open(input_path))
     h, w = img.shape[:2]
     print(f"  Size: {w}x{h}, pk={pk}")
-    print(f"  Offset: {(pk * 64) % (w * h)}")
+    print(f"  Offset: {(pk * (BLOCK_SIZE * BLOCK_SIZE)) % (w * h)}")
 
     print("Descrambling...")
     result = descramble_fast(img, pk)
 
     Image.fromarray(result).save(output_path)
     print(f"Saved to {output_path}")
+
+
+if __name__ == '__main__':
+    main()

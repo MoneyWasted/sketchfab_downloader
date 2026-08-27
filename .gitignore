@@ -1,5 +1,6 @@
 node_modules/
 __pycache__/
+.DS_Store
 
 # Working cache (per-model downloads, decrypted files, descrambled textures)
 .cache/
