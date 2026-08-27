@@ -1,7 +1,11 @@
 'use strict';
 
-const https = require('https');
-const http = require('http');
+import {
+	get as _get
+} from 'https';
+import {
+	get as __get
+} from 'http';
 
 /**
  * Fetches a URL and returns the response body as a Buffer.
@@ -11,17 +15,17 @@ const http = require('http');
  * @returns {Promise<Buffer>} Resolves with the full response body.
  */
 function fetch(url) {
-    return new Promise((resolve, reject) => {
-        const get = url.startsWith('https') ? https.get : http.get;
-        get(url, res => {
-            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                return fetch(res.headers.location).then(resolve, reject);
-            }
-            const chunks = [];
-            res.on('data', c => chunks.push(c));
-            res.on('end', () => resolve(Buffer.concat(chunks)));
-        }).on('error', reject);
-    });
+	return new Promise((resolve, reject) => {
+		const get = url.startsWith('https') ? _get : __get;
+		get(url, res => {
+			if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+				return fetch(res.headers.location).then(resolve, reject);
+			}
+			const chunks = [];
+			res.on('data', c => chunks.push(c));
+			res.on('end', () => resolve(Buffer.concat(chunks)));
+		}).on('error', reject);
+	});
 }
 
 /**
@@ -30,6 +34,11 @@ function fetch(url) {
  * @param {string} url - The URL to fetch (http or https).
  * @returns {Promise<string>} Resolves with the full response body as text.
  */
-function fetchText(url) { return fetch(url).then(b => b.toString('utf8')); }
+function fetchText(url) {
+	return fetch(url).then(b => b.toString('utf8'));
+}
 
-module.exports = { fetch, fetchText };
+export default {
+	fetch,
+	fetchText
+};

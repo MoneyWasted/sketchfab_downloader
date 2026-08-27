@@ -35,33 +35,30 @@ from PIL import Image
 # Module-level constants — must match the GPU shader and src/textures.js
 # ---------------------------------------------------------------------------
 
-BLOCK_SIZE = 8        # Tile dimension for the scramble grid (matches GPU shader)
-ROTATION_COUNT = 4    # Number of intra-block rotation variants
+BLOCK_SIZE = 8  # Tile dimension for the scramble grid (matches GPU shader)
+ROTATION_COUNT = 4  # Number of intra-block rotation variants
 
 
 # ---------------------------------------------------------------------------
 # Low-level helpers
 # ---------------------------------------------------------------------------
 
+
 def mod(i, u):
-    """Return ``i`` modulo ``u`` using truncating (C-style) integer division."""
-    y = i // u
-    return i - y * u
+    """Return ``i`` modulo ``u`` using truncating (C-style) integer division.
 
-
-def min_(a, b):
-    """Return the smaller of two values."""
-    return a if a < b else b
-
-
-def max_(a, b):
-    """Return the larger of two values."""
-    return a if a > b else b
+    Equivalent to Python's ``%`` operator when ``u`` is positive (which is
+    always the case at every call-site in this module).  The explicit helper
+    is kept to mirror the ``imod`` function in the companion JavaScript
+    implementation ``src/textures.js``, making the two files easy to compare.
+    """
+    return i - (i // u) * u
 
 
 # ---------------------------------------------------------------------------
 # Zigzag index math — direct port of the GPU fragment shader
 # ---------------------------------------------------------------------------
+
 
 def triangle_sum(y, t, f_):
     """Compute the partial triangle-number sum used for zigzag index offsets.
@@ -78,8 +75,8 @@ def triangle_sum(y, t, f_):
     Returns:
         Integer offset of the first cell on diagonal ``f_``.
     """
-    x = min_(y, t)
-    n = max_(y, t)
+    x = min(y, t)
+    n = max(y, t)
     if f_ < x:
         return f_ * (f_ + 1) // 2
     if f_ < n:
@@ -103,8 +100,8 @@ def xy_to_zigzag(y, t, pos):
     Returns:
         Scalar zigzag index for the tile at ``pos``.
     """
-    r = min_(y, t)
-    n = max_(y, t)
+    r = min(y, t)
+    n = max(y, t)
     v = pos[0] + pos[1]
     h = mod(v, 2) == 0
     if v < r:
@@ -139,8 +136,8 @@ def zigzag_to_xy(y, t, x):
     Returns:
         ``(col, row)`` tuple — zero-based tile coordinate.
     """
-    v = min_(y, t)
-    r = max_(y, t)
+    v = min(y, t)
+    r = max(y, t)
     threshold1 = v * (v + 1) // 2
     threshold2 = threshold1 + v * (r - v)
 
@@ -259,6 +256,7 @@ def flat_index_to_pixel(idx, w, h):
 # Public descramble routines
 # ---------------------------------------------------------------------------
 
+
 def descramble_texture(img_array, pk):
     """Descramble a Sketchfab texture using the ``pk`` parameter (reference implementation).
 
@@ -343,6 +341,7 @@ def descramble_fast(img_array, pk):
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+
 def main():
     """Command-line entry point for descrambling a single Sketchfab texture.
 
@@ -383,5 +382,5 @@ def main():
     print(f"Saved to {output_path}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
