@@ -5,6 +5,9 @@ import {
 	writeFileSync
 } from 'fs';
 import path from 'path';
+import {
+	load
+} from 'cheerio';
 import _network from './network.js';
 const {
 	fetch,
@@ -14,6 +17,124 @@ import _wasm from './wasm.js';
 const {
 	STATIC_KEY
 } = _wasm;
+
+/** Material channels consumed by the downloader, in preference order. */
+const CHANNELS = ['AlbedoPBR', 'EmitColor', 'NormalMap', 'MetalnessPBR', 'RoughnessPBR'];
+
+/**
+ * Load the embed page into a DOM and return the parsed prefetch JSON that
+ * Sketchfab stashes in an HTML comment inside the hidden
+ * `#js-dom-data-prefetched-data` container (quotes are entity-encoded).
+ *
+ * @param {string} html - Raw embed page HTML.
+ * @param {string} uid  - Model UID (used in error messages).
+ * @returns {Object} Parsed prefetch data: API path → response object.
+ */
+function extractPrefetchData(html, uid) {
+	const $ = load(html);
+	const comment = $('#js-dom-data-prefetched-data')
+		.contents()
+		.toArray()
+		.find(node => node.type === 'comment');
+	if (!comment) {
+		throw new Error('Could not find prefetched model data in embed page for model ' + uid);
+	}
+	return JSON.parse(comment.data.replace(/&#34;/g, '"'));
+}
+
+/**
+ * Extract the download base URL and the decryption parameters (`diterB`,
+ * `diterV`) from the model's file entry.
+ *
+ * @param {Object} model - Prefetched `/i/models/<uid>` entry.
+ * @param {string} uid   - Model UID (used in error messages).
+ * @returns {{ baseUrl: string, diterB: string, diterV: number }}
+ */
+function extractBaseUrl(model, uid) {
+	const file = (model.files || []).find(f => f && typeof f.osgjsUrl === 'string' && f.osgjsUrl.endsWith('/file.binz'));
+	if (!file) throw new Error('Could not find .binz URL in embed page for model ' + uid);
+	const p = Array.isArray(file.p) ? file.p[0] : null;
+	if (!p || p.v === undefined || p.b === undefined) {
+		throw new Error('Could not find encryption key ("p"."b") in embed page for model ' + uid);
+	}
+	return {
+		baseUrl: file.osgjsUrl.replace(/\/file\.binz$/, ''),
+		diterB: p.b,
+		diterV: parseInt(p.v, 10)
+	};
+}
+
+/**
+ * Collect the texture registry as a memoized map of texture-set uid → best
+ * (largest) image, so repeated lookups never re-scan the texture list.
+ *
+ * @param {Object} prefetch - Parsed prefetch data.
+ * @param {string} uid      - Model UID.
+ * @returns {Map<string, { setUid: string, url: string, pk: number, width: number, filename: string }>}
+ */
+function collectTextures(prefetch, uid) {
+	const bestByUid = new Map();
+	const results = prefetch[`/i/models/${uid}/textures?optimized=1`]?.results || [];
+	for (const set of results) {
+		if (!set || !set.uid || !Array.isArray(set.images) || !set.images.length) continue;
+		// First maximum wins on width ties, matching the previous scan order.
+		const best = set.images.reduce((a, b) => (b.width > (a?.width ?? -1) ? b : a), null);
+		if (!best || !best.url) continue;
+		bestByUid.set(set.uid, {
+			setUid: set.uid,
+			url: best.url,
+			pk: best.pk,
+			width: best.width,
+			filename: best.url.split('/').pop()
+		});
+	}
+	return bestByUid;
+}
+
+/**
+ * Parse each material from the model options. A model can have several
+ * materials (e.g. an asteroid pack with one atlas per rock); applying one
+ * material's textures to every geometry makes the others' UVs land in the
+ * atlas's empty regions. Each material's enabled channels are resolved against
+ * the texture registry, and materials are also indexed by their albedo
+ * texture-set uid, which is how each geometry's StateSet references its
+ * material.
+ *
+ * @param {Object} model        - Prefetched `/i/models/<uid>` entry.
+ * @param {Map}    bestTexByUid - Texture registry from {@link collectTextures}.
+ * @returns {{ materials: Object, materialsByAlbedo: Object }}
+ */
+function parseMaterials(model, bestTexByUid) {
+	const materials = {};
+	const materialsByAlbedo = {};
+	const materialDefs = model.options?.materials || {};
+	for (const def of Object.values(materialDefs)) {
+		if (!def || typeof def !== 'object' || !def.name || !def.channels) continue;
+		const chans = {};
+		for (const chName of CHANNELS) {
+			const ch = def.channels[chName];
+			if (!ch || ch.enable !== true) continue;
+			const setUid = ch.texture?.uid;
+			if (!setUid) continue;
+			chans[chName] = {
+				...(bestTexByUid.get(setUid) || {}),
+				setUid
+			};
+			if (chName === 'AlbedoPBR') chans[chName].albedoUid = setUid;
+		}
+		// keep only channels that resolved to a real texture file
+		for (const k of Object.keys(chans))
+			if (!chans[k].url) delete chans[k];
+		if (Object.keys(chans).length) {
+			materials[def.name] = chans;
+			if (chans.AlbedoPBR && chans.AlbedoPBR.setUid) materialsByAlbedo[chans.AlbedoPBR.setUid] = chans;
+		}
+	}
+	return {
+		materials,
+		materialsByAlbedo
+	};
+}
 
 /**
  * Fetch and parse the Sketchfab embed page for a model, returning all the
@@ -33,96 +154,22 @@ const {
  */
 async function getModelConfig(uid) {
 	console.log(`[1/6] Fetching embed page...`);
-	const html = (await fetchText(`https://sketchfab.com/models/${uid}/embed`)).replace(/&#34;/g, '"');
+	const html = await fetchText(`https://sketchfab.com/models/${uid}/embed`);
+	const prefetch = extractPrefetchData(html, uid);
 
-	const pMatch = html.match(/"p"\s*:\s*\[\{[^}]*"v"\s*:\s*(\d+)[^}]*"b"\s*:\s*"([^"]+)"/);
-	if (!pMatch) throw new Error('Could not find encryption key ("p"."b") in embed HTML for model ' + uid);
+	const model = prefetch[`/i/models/${uid}`];
+	if (!model) throw new Error('Could not find model entry in embed page for model ' + uid);
 
-	const binzMatch = html.match(/https:\/\/media\.sketchfab\.com\/models\/[^"]*\/files\/[^"]*\/file\.binz/);
-	if (!binzMatch) throw new Error('Could not find .binz URL in embed HTML for model ' + uid);
-
-	const baseUrl = binzMatch[0].replace(/\/file\.binz$/, '');
-
-	// Extract the texture registry: texture-set uid → best (largest) image.
-	const texEntries = {};
-	const texPattern = /"uid":\s*"([^"]+)"[\s\S]*?"width":\s*(\d+)[\s\S]*?"url":\s*"([^"]+)"[\s\S]*?"pk":\s*(\d+)/g;
-	let tm;
-	while ((tm = texPattern.exec(html)) !== null) {
-		const [, , w, url, pk] = tm;
-		const setMatch = url.match(/\/textures\/([^/]+)\//);
-		if (!setMatch) continue;
-		const setUid = setMatch[1];
-		const key = `${setUid}_${w}`;
-		if (!texEntries[key] || parseInt(w) > texEntries[key].width) {
-			texEntries[key] = {
-				setUid,
-				url,
-				pk: parseInt(pk),
-				width: parseInt(w),
-				filename: url.split('/').pop()
-			};
-		}
-	}
-	const bestTexture = (setUid) => {
-		let best = null;
-		for (const e of Object.values(texEntries))
-			if (e.setUid === setUid && (!best || e.width > best.width)) best = e;
-		return best;
-	};
-
-	// Parse each material separately. A model can have several materials (e.g. an
-	// asteroid pack with one atlas per rock); applying one material's textures to
-	// every geometry makes the others' UVs land in the atlas's empty regions.
-	// Each material is "name": "...", "version": N, "channels": {...}. Pair every
-	// channels block with the material name just before it (works whether names
-	// are like "Asteroid_1_MAT" or "KOBRA_PAINT"), then read its enabled channels
-	// (bounding each channel to the next so a disabled one can't grab the next's
-	// texture). Also index materials by their albedo texture-set uid, which is how
-	// each geometry's StateSet references its material.
-	const CHANNELS = ['AlbedoPBR', 'EmitColor', 'NormalMap', 'MetalnessPBR', 'RoughnessPBR'];
-	const materials = {};
-	const materialsByAlbedo = {};
-	const chanStarts = [...html.matchAll(/"channels"\s*:\s*\{/g)].map(m => m.index);
-	const allNames = [...html.matchAll(/"name"\s*:\s*"([^"]+)"/g)].map(m => ({
-		name: m[1],
-		idx: m.index
-	}));
-	for (let bi = 0; bi < chanStarts.length; bi++) {
-		const cs = chanStarts[bi];
-		let mat = null;
-		for (const mnp of allNames)
-			if (mnp.idx < cs && (!mat || mnp.idx > mat.idx)) mat = mnp;
-		if (!mat) continue;
-		const block = html.slice(cs, bi + 1 < chanStarts.length ? chanStarts[bi + 1] : Math.min(html.length, cs + 6000));
-		const chans = {};
-		for (const chName of CHANNELS) {
-			const ci = block.indexOf(`"${chName}"`);
-			if (ci < 0) continue;
-			let end = block.length;
-			for (const o of CHANNELS) {
-				if (o === chName) continue;
-				const oi = block.indexOf(`"${o}"`, ci + chName.length + 2);
-				if (oi > ci && oi < end) end = oi;
-			}
-			const sub = block.slice(ci, end);
-			if (!/"enable"\s*:\s*true/.test(sub)) continue;
-			const t = sub.match(/"texture"[\s\S]*?"uid"\s*:\s*"([a-f0-9]+)"/);
-			if (t) {
-				chans[chName] = {
-					...(bestTexture(t[1]) || {}),
-					setUid: t[1]
-				};
-				if (chName === 'AlbedoPBR') chans[chName].albedoUid = t[1];
-			}
-		}
-		// keep only channels that resolved to a real texture file
-		for (const k of Object.keys(chans))
-			if (!chans[k].url) delete chans[k];
-		if (Object.keys(chans).length) {
-			materials[mat.name] = chans;
-			if (chans.AlbedoPBR && chans.AlbedoPBR.setUid) materialsByAlbedo[chans.AlbedoPBR.setUid] = chans;
-		}
-	}
+	const {
+		baseUrl,
+		diterB,
+		diterV
+	} = extractBaseUrl(model, uid);
+	const bestTexByUid = collectTextures(prefetch, uid);
+	const {
+		materials,
+		materialsByAlbedo
+	} = parseMaterials(model, bestTexByUid);
 
 	// Backward-compatible single texture map (first material with an albedo).
 	const textureMap = Object.values(materials).find(m => m.AlbedoPBR) || Object.values(materials)[0] || {};
@@ -131,8 +178,8 @@ async function getModelConfig(uid) {
 		uid,
 		baseUrl,
 		html,
-		diterB: pMatch[2],
-		diterV: parseInt(pMatch[1]),
+		diterB,
+		diterV,
 		textureMap,
 		materials,
 		materialsByAlbedo

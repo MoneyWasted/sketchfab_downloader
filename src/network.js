@@ -34,8 +34,9 @@ function fetch(url) {
  * @param {string} url - The URL to fetch (http or https).
  * @returns {Promise<string>} Resolves with the full response body as text.
  */
-function fetchText(url) {
-	return fetch(url).then(b => b.toString('utf8'));
+async function fetchText(url) {
+	const b = await fetch(url);
+	return b.toString('utf8');
 }
 
 export default {

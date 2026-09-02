@@ -51,6 +51,116 @@ const WASM_EXPORTS = {
 
 // ─── WASM helpers ─────────────────────────────────────────────────────────────
 
+/** WASM section ids used by the parser. */
+const WASM_SECTION_GLOBAL = 6;
+const WASM_SECTION_DATA = 11;
+/** Section ids are 0–11; anything ≥ 12 is invalid. */
+const WASM_SECTION_COUNT = 12;
+/** WASM page size in bytes. */
+const WASM_PAGE_SIZE = 65536;
+/** Memory ceiling: 512 MiB in pages. */
+const WASM_MAX_PAGES = 536870912 >> 16;
+/** Extra memory allocated beyond the data segment for the decryptor's heap. */
+const WASM_MEM_OVERHEAD = 262144;
+/** Input bytes fed to the decryptor per process() call. */
+const DECRYPT_CHUNK_SIZE = 10240;
+
+/**
+ * Resolved WASM exports, memoized per exports object so repeated decryptions
+ * over the same instance skip the obfuscated-name lookups.
+ */
+const resolvedExportsCache = new WeakMap();
+
+/**
+ * Resolve the obfuscated WASM export names into a friendly-name → function map.
+ *
+ * @param {WebAssembly.Exports} exports - Raw WASM instance exports.
+ * @returns {{ [name: string]: Function }} Resolved export functions.
+ */
+function resolveWasmExports(exports) {
+	let resolved = resolvedExportsCache.get(exports);
+	if (!resolved) {
+		resolved = {};
+		for (const [name, key] of Object.entries(WASM_EXPORTS)) resolved[name] = exports[key];
+		resolvedExportsCache.set(exports, resolved);
+	}
+	return resolved;
+}
+
+/**
+ * Read a LEB128 unsigned varint from `view` at `cursor`.
+ *
+ * @param {DataView} view   - View over the WASM bytes.
+ * @param {number}   cursor - Read offset.
+ * @returns {[number, number]} [value, nextCursor].
+ */
+function readVaruint(view, cursor) {
+	let value = 0,
+		shift = 0,
+		byte_;
+	do {
+		byte_ = view.getUint8(cursor++);
+		value |= (byte_ & 0x7f) << shift;
+		shift += 7;
+	} while (byte_ & 0x80);
+	return [value, cursor];
+}
+
+/**
+ * Validate a section header before parsing its payload.
+ *
+ * @returns {boolean} True when the section is well-formed and in bounds.
+ */
+function isSectionHeaderValid(sectionType, sectionSize, sectionEnd, length) {
+	return sectionType < WASM_SECTION_COUNT && sectionSize > 0 && sectionEnd <= length;
+}
+
+/**
+ * Parse the global section: read the global count, then the first global's type
+ * byte, mutability byte, init-expr opcode and value — the value is the initial
+ * memory size.
+ *
+ * @returns {{ memSize: number, cursor: number }}
+ */
+function parseGlobalSection(view, cursor) {
+	[, cursor] = readVaruint(view, cursor); // global count
+	cursor++; // value type
+	cursor++; // mutability
+	[, cursor] = readVaruint(view, cursor); // init opcode
+	let memSize;
+	[memSize, cursor] = readVaruint(view, cursor); // init value = initial data size
+	cursor++; // end opcode
+	return {
+		memSize,
+		cursor
+	};
+}
+
+/**
+ * Walk the data section, advancing past each segment's payload bytes.
+ *
+ * @returns {number} Cursor after the last segment visited.
+ */
+function parseDataSection(view, cursor, sectionEnd) {
+	let numSegments;
+	[numSegments, cursor] = readVaruint(view, cursor);
+	for (let seg = 0; seg !== numSegments && cursor < sectionEnd; seg++) {
+		[, cursor] = readVaruint(view, cursor); // segment flags
+		[, cursor] = readVaruint(view, cursor); // init opcode
+		[, cursor] = readVaruint(view, cursor); // offset value
+		cursor++; // end opcode
+		let payloadSize;
+		[payloadSize, cursor] = readVaruint(view, cursor);
+		cursor += payloadSize; // skip segment payload
+	}
+	return cursor;
+}
+
+/** Skip an uninteresting section entirely. */
+function skipSection(_view, _cursor, sectionEnd) {
+	return sectionEnd;
+}
+
 /**
  * Parses WASM section headers to determine the initial data-segment size.
  * Used to size the WebAssembly.Memory allocation before instantiating the module.
@@ -60,58 +170,116 @@ const WASM_EXPORTS = {
  */
 function parseWasmDataSize(wasmBytes) {
 	let initialMem = 65536;
+	const view = new DataView(wasmBytes.buffer, wasmBytes.byteOffset, wasmBytes.byteLength);
+	const length = view.byteLength;
 	let cursor = 8; // skip 4-byte magic + 4-byte version
-	const length = wasmBytes.length;
 
-	const readByte = () => wasmBytes[cursor++];
-	const readVaruint = () => {
-		let value = 0,
-			shift = 0,
-			byte_;
-		do {
-			byte_ = wasmBytes[cursor];
-			value |= (byte_ & 0x7f) << shift;
-			shift += 7;
-			cursor++;
-		} while (byte_ & 0x80);
-		return value;
-	};
-
-	for (; cursor < length;) {
-		const sectionType = readVaruint();
-		const sectionSize = readVaruint();
+	while (cursor < length) {
+		let sectionType, sectionSize;
+		[sectionType, cursor] = readVaruint(view, cursor);
+		[sectionSize, cursor] = readVaruint(view, cursor);
 		const sectionEnd = cursor + sectionSize;
 
-		if (sectionType > 11 || sectionSize <= 0 || sectionEnd > length) break;
+		if (!isSectionHeaderValid(sectionType, sectionSize, sectionEnd, length)) break;
 
-		if (sectionType === 6) {
-			// Global section: read global count, then read each global's type byte,
-			// mutability byte, init-expr opcode and value — the value is the initial memory size.
-			readVaruint(); // global count
-			readByte(); // value type
-			readByte(); // mutability
-			readVaruint(); // init opcode
-			const memSize = readVaruint();
-			readByte(); // end opcode
-			initialMem = memSize;
-		}
-
-		if (sectionType === 11) {
-			// Data section: iterate segments to advance past their payload bytes.
-			const numSegments = readVaruint();
-			for (let seg = 0; seg !== numSegments && cursor < sectionEnd; seg++) {
-				readVaruint(); // segment flags
-				readVaruint(); // init opcode
-				readVaruint(); // offset value
-				readByte(); // end opcode
-				cursor += readVaruint(); // skip segment payload
-			}
+		if (sectionType === WASM_SECTION_GLOBAL) {
+			const parsed = parseGlobalSection(view, cursor);
+			initialMem = parsed.memSize;
+			cursor = parsed.cursor;
+		} else if (sectionType === WASM_SECTION_DATA) {
+			cursor = parseDataSection(view, cursor, sectionEnd);
+		} else {
+			cursor = skipSection(view, cursor, sectionEnd);
 		}
 
 		cursor = sectionEnd; // enforce section boundary regardless of reads above
 	}
 
 	return initialMem;
+}
+
+/**
+ * Allocate the WebAssembly.Memory for the decrypt module.
+ *
+ * @param {number} initialPages        - Initial memory size in 64 KiB pages.
+ * @param {number} [maxPages]          - Maximum memory size in pages.
+ * @returns {WebAssembly.Memory}
+ */
+function createMemory(initialPages, maxPages = WASM_MAX_PAGES) {
+	return new WebAssembly.Memory({
+		initial: initialPages,
+		maximum: maxPages,
+		shared: false
+	});
+}
+
+/**
+ * Cache typed-array views over a (growable) WASM memory. Call `refresh()` after
+ * every `memory.grow()` — growth detaches the old ArrayBuffer.
+ *
+ * @param {WebAssembly.Memory} memory - Memory to wrap.
+ * @returns {{ u8: Uint8Array, u32: Uint32Array, refresh: () => void }}
+ */
+function createMemoryViews(memory) {
+	let u8 = new Uint8Array(memory.buffer),
+		u32 = new Uint32Array(memory.buffer);
+	return {
+		get u8() {
+			return u8;
+		},
+		get u32() {
+			return u32;
+		},
+		refresh() {
+			u8 = new Uint8Array(memory.buffer);
+			u32 = new Uint32Array(memory.buffer);
+		}
+	};
+}
+
+/**
+ * Create the `sbrk` env import: advance the program break, growing memory only
+ * when the break passes the current buffer length, then refresh cached views.
+ *
+ * @param {WebAssembly.Memory} memory       - WASM memory to grow.
+ * @param {object}             views        - Views wrapper from {@link createMemoryViews}.
+ * @param {number}             initialBreak - Initial program break (data size).
+ * @returns {(inc: number) => number}
+ */
+function createSbrk(memory, views, initialBreak) {
+	let currentBreak = initialBreak;
+	return (inc) => {
+		const old = currentBreak;
+		currentBreak += inc;
+		const overflow = currentBreak - memory.buffer.byteLength;
+		if (overflow > 0) {
+			memory.grow((overflow + WASM_PAGE_SIZE - 1) >> 16);
+			views.refresh();
+		}
+		return old | 0;
+	};
+}
+
+/**
+ * Time-related env imports (`time`, `gettimeofday`), isolated so they can be
+ * unit-tested independently of the WASM plumbing.
+ *
+ * @param {object} views - Views wrapper from {@link createMemoryViews}.
+ * @returns {{ time: (t: number) => number, gettimeofday: (t: number) => void }}
+ */
+function createTimeApi(views) {
+	return {
+		time(t) {
+			const now = Date.now() / 1000 | 0;
+			if (t) views.u32[t >> 2] = now;
+			return now;
+		},
+		gettimeofday(t) {
+			const n = Date.now();
+			views.u32[t >> 2] = n / 1000 | 0;
+			views.u32[(t + 4) >> 2] = n % 1000 * 1000 | 0;
+		}
+	};
 }
 
 /**
@@ -131,37 +299,12 @@ async function initWasm(wasmPath) {
 	const wasmBytes = readFileSync(wasmPath);
 	const wasmU8 = new Uint8Array(wasmBytes);
 	const dataSize = parseWasmDataSize(wasmU8);
-	const initialPages = (262144 + ((dataSize + 65535) >> 16 << 16)) >> 16;
-	let currentBreak = dataSize;
-	const memory = new WebAssembly.Memory({
-		initial: initialPages,
-		maximum: 536870912 >> 16,
-		shared: false
-	});
-	let u8 = new Uint8Array(memory.buffer),
-		u32 = new Uint32Array(memory.buffer);
+	const initialPages = (WASM_MEM_OVERHEAD + ((dataSize + WASM_PAGE_SIZE - 1) >> 16 << 16)) >> 16;
+	const memory = createMemory(initialPages);
+	const views = createMemoryViews(memory);
 	const env = {
-		sbrk(inc) {
-			const old = currentBreak;
-			currentBreak += inc;
-			const ov = currentBreak - memory.buffer.byteLength;
-			if (ov > 0) {
-				memory.grow((ov + 65535) >> 16);
-				u8 = new Uint8Array(memory.buffer);
-				u32 = new Uint32Array(memory.buffer);
-			}
-			return old | 0;
-		},
-		time(t) {
-			const now = Date.now() / 1000 | 0;
-			if (t) u32[t >> 2] = now;
-			return now;
-		},
-		gettimeofday(t) {
-			const n = Date.now();
-			u32[t >> 2] = n / 1000 | 0;
-			u32[(t + 4) >> 2] = n % 1000 * 1000 | 0;
-		},
+		sbrk: createSbrk(memory, views, dataSize),
+		...createTimeApi(views),
 		abort() {
 			throw new Error('WASM abort');
 		},
@@ -211,6 +354,37 @@ function deriveKeyWords(keyHex, seed) {
 }
 
 /**
+ * Pack the derived key words as 40 lowercase hex characters (4 per word) into
+ * a single Uint8Array, avoiding the intermediate map/join string allocation.
+ * The WASM key-setup export expects the 40-character hex representation.
+ *
+ * @param {number[]} keyWords - Derived key words (16-bit values).
+ * @returns {Uint8Array} 40 bytes of hex character codes.
+ */
+function packKeyWords(keyWords) {
+	const bytes = new Uint8Array(keyWords.length * 4);
+	keyWords.forEach((word, i) => {
+		const hex = word.toString(16).padStart(4, '0');
+		for (let j = 0; j < 4; j++) bytes[i * 4 + j] = hex.charCodeAt(j);
+	});
+	return bytes;
+}
+
+/**
+ * Yield successive `chunkSize` slices of `input` as subarrays (zero-copy).
+ * The generator keeps the boundary math in one place.
+ *
+ * @param {Uint8Array} input     - Input bytes.
+ * @param {number}     chunkSize - Maximum slice length.
+ * @yields {Uint8Array}
+ */
+function* chunkSlices(input, chunkSize) {
+	for (let off = 0; off < input.length; off += chunkSize) {
+		yield input.subarray(off, Math.min(off + chunkSize, input.length));
+	}
+}
+
+/**
  * Decrypts a .binz file using the WASM decryptor and returns the decrypted bytes.
  * If the decrypted output is gzip-compressed (magic bytes 0x1f 0x8b), it is
  * automatically gunzipped before returning.
@@ -224,16 +398,16 @@ function deriveKeyWords(keyHex, seed) {
 async function decryptBinz(binzPath, diterB, staticKey, wasmPath) {
 	const encData = readFileSync(binzPath);
 	const wasm = await initWasm(wasmPath);
-	const ex = wasm.exports;
-
-	const allocInput = ex[WASM_EXPORTS.allocInput];
-	const reset = ex[WASM_EXPORTS.reset];
-	const setupKey = ex[WASM_EXPORTS.setupKey];
-	const allocDiterB = ex[WASM_EXPORTS.allocDiterB];
-	const process_ = ex[WASM_EXPORTS.process];
-	const advance = ex[WASM_EXPORTS.advance];
-	const getOutputSize = ex[WASM_EXPORTS.getOutputSize];
-	const getOutputStart = ex[WASM_EXPORTS.getOutputStart];
+	const {
+		allocInput,
+		reset,
+		setupKey,
+		allocDiterB,
+		process: processChunk,
+		advance,
+		getOutputSize,
+		getOutputStart
+	} = resolveWasmExports(wasm.exports);
 
 	// ── Phase 1: Derive 10 key words from the static SHA-1 hex key ──────────
 	const keyHex = (staticKey || STATIC_KEY).slice(0, 40).toLowerCase();
@@ -242,29 +416,27 @@ async function decryptBinz(binzPath, diterB, staticKey, wasmPath) {
 
 	// ── Phase 2: Write each key word as a 4-char hex string into WASM memory ─
 	const keyOffset = setupKey(seed, 40);
-	const keyBuf = Buffer.from(keyWords.map(w => w.toString(16).padStart(4, '0')).join(''));
-	wasm.getMemory().set(keyBuf, keyOffset);
+	wasm.getMemory().set(packKeyWords(keyWords), keyOffset);
 
 	const diterBClean = diterB.replace(/\\n/g, '').replace(/\n/g, '');
 	const diterBBytes = Buffer.from(diterBClean, 'base64');
 	reset();
 	const dOff = allocDiterB(diterBBytes.length);
 	wasm.getMemory().set(diterBBytes, dOff);
-	process_(0);
+	processChunk(0);
 
 	const input = new Uint8Array(encData);
 	const chunks = [];
-	for (let off = 0; off < input.length; off += 10240) {
-		const len = Math.min(10240, input.length - off);
-		const iOff = allocInput(len);
-		wasm.getMemory().set(input.subarray(off, off + len), iOff);
-		let more = process_(1);
+	for (const slice of chunkSlices(input, DECRYPT_CHUNK_SIZE)) {
+		const iOff = allocInput(slice.length);
+		wasm.getMemory().set(slice, iOff);
+		let more = processChunk(1);
 		while (more) {
 			const mem = wasm.getMemory();
 			const s = getOutputStart();
 			chunks.push(Buffer.from(mem.subarray(s, s + getOutputSize())));
 			advance();
-			more = process_(0);
+			more = processChunk(0);
 		}
 	}
 	let result = Buffer.concat(chunks);
@@ -279,6 +451,7 @@ async function decryptBinz(binzPath, diterB, staticKey, wasmPath) {
 export default {
 	STATIC_KEY,
 	WASM_EXPORTS,
+	resolveWasmExports,
 	parseWasmDataSize,
 	initWasm,
 	decryptBinz

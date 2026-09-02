@@ -161,6 +161,43 @@ function flatToPixel(idx, w, h) {
 // ─── Exported API ─────────────────────────────────────────────────────────────
 
 /**
+ * Non-blocking filesystem existence check (async replacement for existsSync).
+ *
+ * @param {string} p - Path to test.
+ * @returns {Promise<boolean>} True when the path is accessible.
+ */
+async function pathExists(p) {
+	try {
+		await fs.promises.access(p);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Build the descrambled file name for a scrambled texture file name.
+ *
+ * @param {string} filename - Original texture file name (e.g. `abc123.jpeg`).
+ * @returns {string} Clean file name (e.g. `abc123_clean.jpeg`).
+ */
+function makeCleanName(filename) {
+	const ext = filename.endsWith('.png') ? '.png' : '.jpeg';
+	return filename.replace(/\.[^.]+$/, '') + '_clean' + ext;
+}
+
+/**
+ * Build the absolute path of a texture file inside the model's textures dir.
+ *
+ * @param {string} workDir  - Model working directory.
+ * @param {string} fileName - Texture file name.
+ * @returns {string} Absolute path under `<workDir>/textures/`.
+ */
+function makeTexturePath(workDir, fileName) {
+	return path.join(workDir, 'textures', fileName);
+}
+
+/**
  * Descrambles a single raw pixel buffer using the Sketchfab zigzag permutation.
  *
  * @param {Buffer} imgBuf  Raw pixel data (interleaved channels).
@@ -248,18 +285,35 @@ async function descrambleTextures(config, workDir) {
 	}
 
 	// Descramble every texture (dedup by filename), then build one clean map per
-	// material plus that material's combined metal/rough texture.
+	// material plus that material's combined metal/rough texture. Decoded raw
+	// images are cached per file name so the metal/rough merge can reuse the
+	// buffers decoded (and descrambled) above instead of re-decoding from disk.
+	const decodedCache = new Map();
+	const decodeCached = async (fileName) => {
+		let img = decodedCache.get(fileName);
+		if (!img) {
+			img = await decodeImage(makeTexturePath(workDir, fileName));
+			decodedCache.set(fileName, img);
+		}
+		return img;
+	};
+
 	const descrambledCache = {};
 	async function descrambleOne(tex) {
 		if (descrambledCache[tex.filename]) return descrambledCache[tex.filename];
-		const ext = tex.filename.endsWith('.png') ? '.png' : '.jpeg';
-		const cleanName = tex.filename.replace(/\.[^.]+$/, '') + '_clean' + ext;
-		const dstPath = path.join(workDir, 'textures', cleanName);
-		if (!fs.existsSync(dstPath)) {
-			const img = await decodeImage(path.join(workDir, 'textures', tex.filename));
+		const cleanName = makeCleanName(tex.filename);
+		const dstPath = makeTexturePath(workDir, cleanName);
+		if (!(await pathExists(dstPath))) {
+			const img = await decodeCached(tex.filename);
 			console.log(`  ${tex.filename}: ${img.width}x${img.height} pk=${tex.pk}`);
 			const descrambled = descrambleTexture(img.data, img.width, img.height, img.channels, tex.pk);
 			await encodeImage(descrambled, img.width, img.height, img.channels, dstPath);
+			decodedCache.set(cleanName, {
+				data: descrambled,
+				width: img.width,
+				height: img.height,
+				channels: img.channels
+			});
 		}
 		descrambledCache[tex.filename] = cleanName;
 		return cleanName;
@@ -281,10 +335,10 @@ async function descrambleTextures(config, workDir) {
 		// one texture; Sketchfab ships them separately, so combine per material.
 		if (cleanMap.MetalnessPBR && cleanMap.RoughnessPBR) {
 			const combName = cleanMap.MetalnessPBR.cleanFile.replace(/_clean.*/, '') + '_metalrough.png';
-			const combPath = path.join(workDir, 'textures', combName);
-			if (!fs.existsSync(combPath)) {
-				const mImg = await decodeImage(path.join(workDir, 'textures', cleanMap.MetalnessPBR.cleanFile));
-				const rImg = await decodeImage(path.join(workDir, 'textures', cleanMap.RoughnessPBR.cleanFile));
+			const combPath = makeTexturePath(workDir, combName);
+			if (!(await pathExists(combPath))) {
+				const mImg = await decodeCached(cleanMap.MetalnessPBR.cleanFile);
+				const rImg = await decodeCached(cleanMap.RoughnessPBR.cleanFile);
 				const w = mImg.width,
 					h = mImg.height,
 					mc = mImg.channels,
