@@ -198,6 +198,198 @@ function makeTexturePath(workDir, fileName) {
 }
 
 /**
+ * Load the `sharp` image library and wrap it in raw decode/encode helpers.
+ *
+ * @returns {Promise<{ decodeImage: Function, encodeImage: Function } | null>}
+ *          The processors, or null when sharp is not installed.
+ */
+async function getImageProcessors() {
+	let sharp;
+	try {
+		({
+			default: sharp
+		} = await import('sharp'));
+	} catch (e) {
+		return null;
+	}
+	const decodeImage = async (p) => {
+		const {
+			data,
+			info
+		} = await sharp(p).raw().toBuffer({
+			resolveWithObject: true
+		});
+		return {
+			data,
+			width: info.width,
+			height: info.height,
+			channels: info.channels
+		};
+	};
+	const encodeImage = async (buf, w, h, ch, outPath) => {
+		await sharp(buf, {
+				raw: {
+					width: w,
+					height: h,
+					channels: ch
+				}
+			})
+			.toFormat(outPath.endsWith('.png') ? 'png' : 'jpeg', {
+				quality: 95
+			})
+			.toFile(outPath);
+	};
+	return {
+		decodeImage,
+		encodeImage
+	};
+}
+
+/**
+ * Combine a material's separate metalness and roughness textures into one
+ * glTF-style texture (roughness in G, metalness in B). Writes the combined
+ * PNG next to the other textures and returns its file name.
+ *
+ * @param {object}   cleanMap     - Material channel map with `cleanFile` set.
+ * @param {string}   workDir      - Model working directory.
+ * @param {Function} decodeCached - Cached raw-image decoder (fileName → image).
+ * @param {Function} encodeImage  - Raw-image encoder.
+ * @returns {Promise<string>} The combined texture's file name.
+ */
+async function combineMetalRough(cleanMap, workDir, decodeCached, encodeImage) {
+	const combName = cleanMap.MetalnessPBR.cleanFile.replace(/_clean.*/, '') + '_metalrough.png';
+	const combPath = makeTexturePath(workDir, combName);
+	if (!(await pathExists(combPath))) {
+		const mImg = await decodeCached(cleanMap.MetalnessPBR.cleanFile);
+		const rImg = await decodeCached(cleanMap.RoughnessPBR.cleanFile);
+		const w = mImg.width,
+			h = mImg.height,
+			mc = mImg.channels,
+			rc = rImg.channels;
+		const out = Buffer.alloc(w * h * 3);
+		for (let i = 0; i < w * h; i++) {
+			out[i * 3] = 255;
+			out[i * 3 + 1] = rImg.data[i * rc];
+			out[i * 3 + 2] = mImg.data[i * mc];
+		}
+		await encodeImage(out, w, h, 3, combPath);
+	}
+	return combName;
+}
+
+/**
+ * Create a memoized raw-image decoder for a working directory. Decoded raw
+ * images are cached per file name so the metal/rough merge can reuse buffers
+ * decoded (and descrambled) earlier instead of re-decoding from disk.
+ *
+ * @param {string}   workDir     - Model working directory.
+ * @param {Function} decodeImage - Raw-image decoder (path → image).
+ * @returns {{ decodeCached: (fileName: string) => Promise<object>, cache: Map }}
+ */
+function createDecodeCache(workDir, decodeImage) {
+	const cache = new Map();
+	const decodeCached = async (fileName) => {
+		let img = cache.get(fileName);
+		if (!img) {
+			img = await decodeImage(makeTexturePath(workDir, fileName));
+			cache.set(fileName, img);
+		}
+		return img;
+	};
+	return {
+		decodeCached,
+		cache
+	};
+}
+
+/**
+ * Create a `descrambleOne(tex)` function for a working directory. Each
+ * texture is descrambled once (dedup by file name) and the descrambled pixels
+ * are fed back into the decode cache for reuse by the metal/rough merge.
+ *
+ * @param {string}   workDir     - Model working directory.
+ * @param {Function} decodeCached - Cached decoder from {@link createDecodeCache}.
+ * @param {Map}      decodedCache - Shared raw-image cache.
+ * @param {Function} encodeImage - Raw-image encoder.
+ * @returns {(tex: object) => Promise<string>} Resolver: tex → clean file name.
+ */
+function createDescrambler(workDir, decodeCached, decodedCache, encodeImage) {
+	const descrambledCache = new Map();
+	return async function descrambleOne(tex) {
+		const cached = descrambledCache.get(tex.filename);
+		if (cached) return cached;
+		const cleanName = makeCleanName(tex.filename);
+		const dstPath = makeTexturePath(workDir, cleanName);
+		if (!(await pathExists(dstPath))) {
+			const img = await decodeCached(tex.filename);
+			console.log(`  ${tex.filename}: ${img.width}x${img.height} pk=${tex.pk}`);
+			const descrambled = descrambleTexture(img.data, img.width, img.height, img.channels, tex.pk);
+			await encodeImage(descrambled, img.width, img.height, img.channels, dstPath);
+			decodedCache.set(cleanName, {
+				data: descrambled,
+				width: img.width,
+				height: img.height,
+				channels: img.channels
+			});
+		}
+		descrambledCache.set(tex.filename, cleanName);
+		return cleanName;
+	};
+}
+
+/**
+ * Pick the materials map to process: the per-material map when present and
+ * non-empty, otherwise a single `default` material from the texture map.
+ *
+ * @param {object} config - Model config object produced by `getModelConfig`.
+ * @returns {object} Material name → channel map.
+ */
+function selectMaterials(config) {
+	const materials = config.materials;
+	return materials && Object.keys(materials).length ? materials : {
+		default: config.textureMap
+	};
+}
+
+/**
+ * Handle a failed channel descramble: warn and fall back to the original
+ * (still-scrambled) texture entry so the rest of the pipeline can continue.
+ *
+ * @param {string} chName - Channel name (for the warning).
+ * @param {object} tex    - Original texture entry.
+ * @param {*}      err    - Rejection reason.
+ * @returns {object} The original texture entry.
+ */
+function handleChannelFailure(chName, tex, err) {
+	console.warn(`  ${chName} descramble failed: ${err && err.message}`);
+	return tex;
+}
+
+/**
+ * Descramble one material's channels in parallel and build its clean map.
+ * Each channel resolves to `{ ...tex, cleanFile }`, or the original entry on
+ * failure. Runs once per material; the caller combines metal/rough after.
+ *
+ * @param {[string, object][]} chanEntries   - `[channelName, tex]` pairs.
+ * @param {Function}           descrambleOne - tex → clean file name.
+ * @returns {Promise<object>} The material's clean channel map.
+ */
+async function processChannels(chanEntries, descrambleOne) {
+	const cleanFiles = await Promise.all(
+		chanEntries.map(([chName, tex]) =>
+			descrambleOne(tex).catch((err) => handleChannelFailure(chName, tex, err))
+		)
+	);
+	return Object.fromEntries(chanEntries.map(([chName, tex], i) => {
+		const cleanFile = cleanFiles[i];
+		return [chName, typeof cleanFile === 'string' ? {
+			...tex,
+			cleanFile
+		} : cleanFile];
+	}));
+}
+
+/**
  * Descrambles a single raw pixel buffer using the Sketchfab zigzag permutation.
  *
  * @param {Buffer} imgBuf  Raw pixel data (interleaved channels).
@@ -242,117 +434,36 @@ function descrambleTexture(imgBuf, w, h, channels, pk) {
  */
 async function descrambleTextures(config, workDir) {
 	console.log(`[4/6] Descrambling textures...`);
-	// Use sharp or jimp for image decode. Fall back to raw decode.
-	let decodeImage, encodeImage;
-	try {
-		const {
-			default: sharp
-		} = await import('sharp');
-		decodeImage = async (p) => {
-			const {
-				data,
-				info
-			} = await sharp(p).raw().toBuffer({
-				resolveWithObject: true
-			});
-			return {
-				data,
-				width: info.width,
-				height: info.height,
-				channels: info.channels
-			};
-		};
-		encodeImage = async (buf, w, h, ch, outPath) => {
-			await sharp(buf, {
-					raw: {
-						width: w,
-						height: h,
-						channels: ch
-					}
-				})
-				.toFormat(outPath.endsWith('.png') ? 'png' : 'jpeg', {
-					quality: 95
-				})
-				.toFile(outPath);
-		};
-	} catch (e) {
-		// Fallback: use the scrambled textures as-is (user can descramble separately)
+	// Image decode/encode processors (sharp). Falls back to the scrambled
+	// textures as-is when sharp is unavailable so the pipeline can continue.
+	const processors = await getImageProcessors();
+	if (!processors) {
 		console.log('  sharp not available — install with: npm install sharp');
 		console.log('  Using scrambled textures (run descramble.py separately)');
-		return config.materials && Object.keys(config.materials).length ? config.materials : {
-			default: config.textureMap
-		};
+		return selectMaterials(config);
 	}
+	const {
+		decodeImage,
+		encodeImage
+	} = processors;
 
-	// Descramble every texture (dedup by filename), then build one clean map per
-	// material plus that material's combined metal/rough texture. Decoded raw
-	// images are cached per file name so the metal/rough merge can reuse the
-	// buffers decoded (and descrambled) above instead of re-decoding from disk.
-	const decodedCache = new Map();
-	const decodeCached = async (fileName) => {
-		let img = decodedCache.get(fileName);
-		if (!img) {
-			img = await decodeImage(makeTexturePath(workDir, fileName));
-			decodedCache.set(fileName, img);
-		}
-		return img;
-	};
+	const {
+		decodeCached,
+		cache: decodedCache
+	} = createDecodeCache(workDir, decodeImage);
+	const descrambleOne = createDescrambler(workDir, decodeCached, decodedCache, encodeImage);
 
-	const descrambledCache = {};
-	async function descrambleOne(tex) {
-		if (descrambledCache[tex.filename]) return descrambledCache[tex.filename];
-		const cleanName = makeCleanName(tex.filename);
-		const dstPath = makeTexturePath(workDir, cleanName);
-		if (!(await pathExists(dstPath))) {
-			const img = await decodeCached(tex.filename);
-			console.log(`  ${tex.filename}: ${img.width}x${img.height} pk=${tex.pk}`);
-			const descrambled = descrambleTexture(img.data, img.width, img.height, img.channels, tex.pk);
-			await encodeImage(descrambled, img.width, img.height, img.channels, dstPath);
-			decodedCache.set(cleanName, {
-				data: descrambled,
-				width: img.width,
-				height: img.height,
-				channels: img.channels
-			});
-		}
-		descrambledCache[tex.filename] = cleanName;
-		return cleanName;
-	}
-
-	const mats = (config.materials && Object.keys(config.materials).length) ? config.materials : {
-		default: config.textureMap
-	};
+	const mats = selectMaterials(config);
 	const materialsClean = {};
 	for (const [matName, chans] of Object.entries(mats)) {
-		const cleanMap = {};
-		for (const [chName, tex] of Object.entries(chans)) {
-			cleanMap[chName] = {
-				...tex,
-				cleanFile: await descrambleOne(tex)
-			};
-		}
+		// Descramble this material's channels (in parallel), then combine the
+		// metal/rough pair once — after the clean map is fully built.
+		const cleanMap = await processChannels(Object.entries(chans), descrambleOne);
 		// glTF packs roughness in the G channel and metalness in the B channel of
 		// one texture; Sketchfab ships them separately, so combine per material.
 		if (cleanMap.MetalnessPBR && cleanMap.RoughnessPBR) {
-			const combName = cleanMap.MetalnessPBR.cleanFile.replace(/_clean.*/, '') + '_metalrough.png';
-			const combPath = makeTexturePath(workDir, combName);
-			if (!(await pathExists(combPath))) {
-				const mImg = await decodeCached(cleanMap.MetalnessPBR.cleanFile);
-				const rImg = await decodeCached(cleanMap.RoughnessPBR.cleanFile);
-				const w = mImg.width,
-					h = mImg.height,
-					mc = mImg.channels,
-					rc = rImg.channels;
-				const out = Buffer.alloc(w * h * 3);
-				for (let i = 0; i < w * h; i++) {
-					out[i * 3] = 255;
-					out[i * 3 + 1] = rImg.data[i * rc];
-					out[i * 3 + 2] = mImg.data[i * mc];
-				}
-				await encodeImage(out, w, h, 3, combPath);
-			}
 			cleanMap.MetalRough = {
-				cleanFile: combName
+				cleanFile: await combineMetalRough(cleanMap, workDir, decodeCached, encodeImage)
 			};
 		}
 		materialsClean[matName] = cleanMap;

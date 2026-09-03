@@ -46,6 +46,28 @@ const GLTF_SAMPLER_LINEAR_MIPMAP = 9987; // GL_LINEAR_MIPMAP_LINEAR
 const GLTF_SAMPLER_LINEAR = 9729; // GL_LINEAR
 const GLTF_WRAP_REPEAT = 10497; // GL_REPEAT
 
+// Aliases used by the default sampler, so future updates touch one constant.
+const MAG_FILTER = GLTF_SAMPLER_LINEAR;
+const MIN_FILTER = GLTF_SAMPLER_LINEAR_MIPMAP;
+const WRAP_S = GLTF_WRAP_REPEAT;
+const WRAP_T = GLTF_WRAP_REPEAT;
+
+/** Accessor component count → glTF `type` name. */
+const SIZE_TO_TYPE = {
+	1: 'SCALAR',
+	2: 'VEC2',
+	3: 'VEC3',
+	4: 'VEC4'
+};
+
+/** glTF componentType → typed-array constructor used when staging bytes. */
+const COMPONENT_TYPE_MAP = {
+	[GLTF_COMPONENT_FLOAT]: Float32Array,
+	[GLTF_COMPONENT_UINT]: Uint32Array,
+	[GLTF_COMPONENT_USHORT]: Uint16Array,
+	[GLTF_COMPONENT_UBYTE]: Uint8Array
+};
+
 // ─── Geometry processing helpers ────────────────────────────────────────────
 
 /**
@@ -142,6 +164,186 @@ function processPrimitives(primitiveSetList, meta, resolveBin) {
 	};
 }
 
+// ─── Vertex-attribute helpers ─────────────────────────────────────────────────
+
+/**
+ * Undo parallelogram prediction residuals when the attribute's mode bit is
+ * set, then dequantize if the metadata carries a bounding box (`<pfx>bbl_x`/
+ * `<pfx>h_…`). Returns a Float32Array when dequantized, otherwise the input.
+ *
+ * @param {TypedArray}      data   - Raw attribute data (may be mutated).
+ * @param {number}          itemSize - Components per element.
+ * @param {number}          mode   - Attribute mode bitmask (bit 1 = predict).
+ * @param {TypedArray|null} stripIndices - Decoded strip indices, if any.
+ * @param {object}          meta   - Flattened metadata (for bbl/h lookups).
+ * @param {string}          pfx    - Metadata key prefix (`vtx_`, `uv_0_`, …).
+ * @param {boolean}         withZ  - Whether to include the Z component bounds.
+ * @returns {TypedArray}
+ */
+function dequantizeVertex(data, itemSize, mode, stripIndices, meta, pfx, withZ) {
+	if ((mode & 2) && stripIndices) parallelogramPredict(data, itemSize, stripIndices);
+	if (meta[pfx + 'bbl_x'] !== undefined) {
+		const bbl = [meta[pfx + 'bbl_x'], meta[pfx + 'bbl_y']];
+		const h = [meta[pfx + 'h_x'], meta[pfx + 'h_y']];
+		if (withZ) {
+			bbl.push(meta[pfx + 'bbl_z']);
+			h.push(meta[pfx + 'h_z']);
+		}
+		data = dequantize(data, new Float32Array(data.length), bbl, h, itemSize);
+	}
+	return data;
+}
+
+/**
+ * Decode a spherically-quantized Normal or Tangent attribute.
+ *
+ * @param {TypedArray} data     - Encoded integer pairs.
+ * @param {number}     count    - Number of vertices.
+ * @param {number}     itemSize - 3 for normals, 4 for tangents (W = sign).
+ * @param {number}     epsilon  - Cone half-angle (degrees) from metadata.
+ * @param {number}     nphi     - Phi subdivisions from metadata.
+ * @returns {Float32Array}
+ */
+function decodeNormalAttribute(data, count, itemSize, epsilon, nphi) {
+	return decodeNormals(data, new Float32Array(count * itemSize), itemSize, epsilon, nphi);
+}
+
+/**
+ * Exact-name vertex attribute handlers. Each receives `(data, itemSize, count)`
+ * with `this` bound to a context object `{ vertexMode, stripIndices, meta,
+ * attrFlags, epsilon, nphi, metaRest }` and returns `{ key, attr }` or null.
+ *
+ * @type {Map<string, (data: TypedArray, itemSize: number, count: number) => ({ key: string, attr: object } | null)>}
+ */
+const VERTEX_ATTR_HANDLERS = new Map([
+	['Vertex', function(data, itemSize, count) {
+		data = dequantizeVertex(data, itemSize, this.vertexMode, this.stripIndices, this.meta, 'vtx_', itemSize === 3);
+		return {
+			key: 'POSITION',
+			attr: {
+				data,
+				itemSize,
+				count
+			}
+		};
+	}],
+	['Normal', function(data, _itemSize, count) {
+		if (!(this.attrFlags & 2)) return null;
+		return {
+			key: 'NORMAL',
+			attr: {
+				data: decodeNormalAttribute(data, count, 3, this.epsilon, this.nphi),
+				itemSize: 3,
+				count
+			}
+		};
+	}],
+	['Tangent', function(data, _itemSize, count) {
+		if (!(this.attrFlags & 32)) return null;
+		return {
+			key: 'TANGENT',
+			attr: {
+				data: decodeNormalAttribute(data, count, 4, this.epsilon, this.nphi),
+				itemSize: 4,
+				count
+			}
+		};
+	}],
+	['Color', function(data, itemSize, count) {
+		if (data instanceof Uint8Array)
+			return {
+				key: 'COLOR_0',
+				attr: {
+					data,
+					itemSize: itemSize || 4,
+					count,
+					normalized: true,
+					componentType: GLTF_COMPONENT_UBYTE
+				}
+			};
+		return {
+			key: 'COLOR_0',
+			attr: {
+				data: new Float32Array(data),
+				itemSize: itemSize || 4,
+				count
+			}
+		};
+	}],
+]);
+
+/**
+ * Shared handler for all `TexCoord*` attributes; the glTF key is derived from
+ * the attribute name suffix (`_TC_0`, `_TC_1`, …).
+ */
+function texCoordAttrHandler(data, itemSize, count, name) {
+	const uvSuffix = name.replace('TexCoord', '');
+	const uvPrefix = `uv_${uvSuffix}_`;
+	const uvMode = this.meta[uvPrefix + 'mode'] !== undefined ? this.meta[uvPrefix + 'mode'] : this.vertexMode;
+	data = dequantizeVertex(data, itemSize, uvMode, this.stripIndices, this.meta, uvPrefix, false);
+	if (!(data instanceof Float32Array)) data = new Float32Array(data);
+	for (let i = 1; i < data.length; i += (itemSize || 2)) data[i] = 1.0 - data[i];
+	return {
+		key: `_TC_${uvSuffix}`,
+		attr: {
+			data,
+			itemSize: itemSize || 2,
+			count
+		}
+	};
+}
+
+/**
+ * Build the handler-resolution machinery for one geometry's attributes: a
+ * cached lookup map of exact-name handlers bound to the shared context, plus
+ * a `resolveHandler` function that falls back to the shared TexCoord handler.
+ *
+ * @param {object} ctx - Handler invocation context (see {@link processVertexAttributes}).
+ * @returns {{ resolveHandler: (name: string) => (Function|null) }}
+ */
+function buildAttrHandlers(ctx) {
+	const texCoordHandler = texCoordAttrHandler.bind(ctx);
+	const boundHandlers = new Map();
+	for (const [name, fn] of VERTEX_ATTR_HANDLERS) boundHandlers.set(name, fn.bind(ctx));
+	const resolveHandler = (name) =>
+		boundHandlers.get(name) ?? (name.startsWith('TexCoord') ? texCoordHandler : null);
+	return {
+		resolveHandler
+	};
+}
+
+/**
+ * Process a single vertex attribute into the accumulating attrs/tcKeys.
+ *
+ * @param {object}   acc           - Accumulator: `{ attrs, tcKeys }`.
+ * @param {[string, object]} entry - `[name, def]` from the VertexAttributeList.
+ * @param {object}   ctx           - Handler invocation context.
+ * @param {Function} resolveHandler- name → handler resolver.
+ * @param {Function} resolveBin    - File field → binary buffer resolver.
+ * @returns {object} The accumulator.
+ */
+function processSingleAttribute(acc, [name, def], ctx, resolveHandler, resolveBin) {
+	const handler = resolveHandler(name);
+	if (!handler) return acc;
+	const arrayInfo = def.Array;
+	if (!arrayInfo) return acc;
+	const [typeName, arrayDef] = Object.entries(arrayInfo)[0];
+	const bin = resolveBin(arrayDef.File);
+	if (!bin) return acc;
+	const itemSize = def.ItemSize || 1;
+	const data = readBuf(bin.buffer, {
+		...arrayDef,
+		ItemSize: itemSize
+	}, itemSize, typeName);
+	const count = arrayDef.Size;
+	const result = handler(data, itemSize, count, name);
+	if (result) {
+		acc.attrs[result.key] = result.attr;
+		if (result.key.startsWith('_TC_')) acc.tcKeys.push(result.key);
+	}
+	return acc;
+}
+
 /**
  * Process the VertexAttributeList of a geometry into glTF attributes.
  *
@@ -158,127 +360,110 @@ function processPrimitives(primitiveSetList, meta, resolveBin) {
  *          tcKeys lists the temporary _TC_* keys for the caller to remap.
  */
 function processVertexAttributes(vaList, meta, attrFlags, stripIndices, resolveBin) {
-	const vertexMode = meta.vertex_mode || 0;
+	// Pull hot metadata into locals; the rest is looked up on `meta` directly.
+	const {
+		vertex_mode: vertexMode = 0,
+		epsilon,
+		nphi,
+		...metaRest
+	} = meta;
 
-	// Attribute handlers keyed by exact name. Each receives the raw typed
-	// data, itemSize, and vertex count and returns { key, attr } to store in
-	// attrs, or null to skip. TexCoord* is handled via prefix match below
-	// because its key is dynamic.
-	const attrHandlers = {
-		Vertex(data, itemSize, count) {
-			if ((vertexMode & 2) && stripIndices) parallelogramPredict(data, itemSize, stripIndices);
-			const pfx = 'vtx_';
-			if (meta[pfx + 'bbl_x'] !== undefined) {
-				const bbl = [meta[pfx + 'bbl_x'], meta[pfx + 'bbl_y']];
-				const h = [meta[pfx + 'h_x'], meta[pfx + 'h_y']];
-				if (itemSize === 3) {
-					bbl.push(meta[pfx + 'bbl_z']);
-					h.push(meta[pfx + 'h_z']);
-				}
-				data = dequantize(data, new Float32Array(data.length), bbl, h, itemSize);
-			}
-			return {
-				key: 'POSITION',
-				attr: {
-					data,
-					itemSize,
-					count
-				}
-			};
-		},
-		Normal(data, _itemSize, count) {
-			if (!(attrFlags & 2)) return null;
-			return {
-				key: 'NORMAL',
-				attr: {
-					data: decodeNormals(data, new Float32Array(count * 3), 3, meta.epsilon, meta.nphi),
-					itemSize: 3,
-					count
-				}
-			};
-		},
-		Tangent(data, _itemSize, count) {
-			if (!(attrFlags & 32)) return null;
-			return {
-				key: 'TANGENT',
-				attr: {
-					data: decodeNormals(data, new Float32Array(count * 4), 4, meta.epsilon, meta.nphi),
-					itemSize: 4,
-					count
-				}
-			};
-		},
-		Color(data, itemSize, count) {
-			if (data instanceof Uint8Array)
-				return {
-					key: 'COLOR_0',
-					attr: {
-						data,
-						itemSize: itemSize || 4,
-						count,
-						normalized: true,
-						componentType: GLTF_COMPONENT_UBYTE
-					}
-				};
-			return {
-				key: 'COLOR_0',
-				attr: {
-					data: new Float32Array(data),
-					itemSize: itemSize || 4,
-					count
-				}
-			};
-		},
-		TexCoord(data, itemSize, count, name) {
-			const uvSuffix = name.replace('TexCoord', '');
-			const uvPrefix = `uv_${uvSuffix}_`;
-			const uvMode = meta[`uv_${uvSuffix}_mode`] !== undefined ? meta[`uv_${uvSuffix}_mode`] : vertexMode;
-			if ((uvMode & 2) && stripIndices) parallelogramPredict(data, itemSize, stripIndices);
-			if (meta[uvPrefix + 'bbl_x'] !== undefined) {
-				const bbl = [meta[uvPrefix + 'bbl_x'], meta[uvPrefix + 'bbl_y']];
-				const h = [meta[uvPrefix + 'h_x'], meta[uvPrefix + 'h_y']];
-				data = dequantize(data, new Float32Array(data.length), bbl, h, itemSize);
-			} else if (!(data instanceof Float32Array)) {
-				data = new Float32Array(data);
-			}
-			for (let i = 1; i < data.length; i += (itemSize || 2)) data[i] = 1.0 - data[i];
-			return {
-				key: `_TC_${uvSuffix}`,
-				attr: {
-					data,
-					itemSize: itemSize || 2,
-					count
-				}
-			};
-		}
+	// Handler invocation context shared by every attribute of this geometry.
+	const ctx = {
+		vertexMode,
+		epsilon,
+		nphi,
+		attrFlags,
+		stripIndices,
+		meta,
+		metaRest
 	};
+	const {
+		resolveHandler
+	} = buildAttrHandlers(ctx);
 
-	// Exact names hit the table directly; TexCoord* falls back to its prefix handler.
-	const resolveHandler = (name) => attrHandlers[name] || (name.startsWith('TexCoord') ? attrHandlers.TexCoord : null);
-
-	const attrs = {};
-	for (const [name, def] of Object.entries(vaList)) {
-		const handler = resolveHandler(name);
-		if (!handler) continue;
-		const arrayInfo = def.Array;
-		if (!arrayInfo) continue;
-		const [typeName, arrayDef] = Object.entries(arrayInfo)[0];
-		const bin = resolveBin(arrayDef.File);
-		if (!bin) continue;
-		const itemSize = def.ItemSize || 1;
-		const data = readBuf(bin.buffer, {
-			...arrayDef,
-			ItemSize: itemSize
-		}, itemSize, typeName);
-		const count = arrayDef.Size;
-		const result = handler(data, itemSize, count, name);
-		if (result) attrs[result.key] = result.attr;
-	}
-
-	const tcKeys = Object.keys(attrs).filter(k => k.startsWith('_TC_')).sort();
+	const {
+		attrs,
+		tcKeys
+	} = Object.entries(vaList).reduce(
+		(acc, entry) => processSingleAttribute(acc, entry, ctx, resolveHandler, resolveBin), {
+			attrs: {},
+			tcKeys: []
+		});
+	tcKeys.sort();
 	return {
 		attrs,
 		tcKeys
+	};
+}
+
+/**
+ * Concatenate all triangle index chunks into a single flat Uint32Array.
+ *
+ * @param {TypedArray[]} triChunks - Decoded triangle index chunks.
+ * @returns {Uint32Array|null} The combined indices, or null when empty.
+ */
+function concatIndices(triChunks) {
+	const totalIndexCount = triChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+	if (!totalIndexCount) return null;
+	const indices = new Uint32Array(totalIndexCount);
+	let offset = 0;
+	for (const chunk of triChunks) {
+		indices.set(chunk, offset);
+		offset += chunk.length;
+	}
+	return indices;
+}
+
+/**
+ * Flatten a geometry's UserDataContainer values into a plain metadata object,
+ * coercing numeric strings to numbers. Pure; returns {} when absent.
+ *
+ * @param {object} geom - osgjs Geometry object.
+ * @returns {object}
+ */
+function extractMeta(geom) {
+	const values = geom.UserDataContainer?.Values;
+	if (!values) return {};
+	return values.reduce((m, v) => {
+		m[v.Name] = isNaN(Number(v.Value)) ? v.Value : Number(v.Value);
+		return m;
+	}, {});
+}
+
+/**
+ * Resolve the material linkage for a geometry from its StateSet in a single
+ * flattened pass: the first `osg.Material` name and the first texture file's
+ * texture-set uid.
+ *
+ * @param {object} geom - osgjs Geometry object.
+ * @returns {{ matName: string|null, texSetUid: string|null }}
+ */
+function resolveMaterialLink(geom) {
+	const stateSet = geom.StateSet && (geom.StateSet['osg.StateSet'] || geom.StateSet);
+	if (!stateSet) {
+		return {
+			matName: null,
+			texSetUid: null
+		};
+	}
+	const matAttr = (stateSet.AttributeList || []).find(a => a['osg.Material'] && a['osg.Material'].Name);
+	const matName = matAttr ? matAttr['osg.Material'].Name : null;
+	let texSetUid = null;
+	for (const unit of (stateSet.TextureAttributeList || [])) {
+		for (const texAttr of (unit || [])) {
+			const texFilePath = texAttr['osg.Texture'] && texAttr['osg.Texture'].File;
+			const m = texFilePath && texFilePath.match(/textures\/([^/]+)\//);
+			if (m) {
+				texSetUid = m[1];
+				break;
+			}
+		}
+		if (texSetUid) break;
+	}
+	return {
+		matName,
+		texSetUid
 	};
 }
 
@@ -292,11 +477,7 @@ function processVertexAttributes(vaList, meta, attrFlags, stripIndices, resolveB
  * @returns {{ name: string, indices: Uint32Array, attributes: object, matName: string|null, texSetUid: string|null } | null}
  */
 function processGeom(geom, resolveBin) {
-	// Collect UserDataContainer values into a flat meta object.
-	const meta = geom.UserDataContainer?.Values?.reduce((m, v) => {
-		m[v.Name] = isNaN(Number(v.Value)) ? v.Value : Number(v.Value);
-		return m;
-	}, {}) ?? {};
+	const meta = extractMeta(geom);
 
 	const attrFlags = (meta.attributes || 0);
 	const {
@@ -304,15 +485,8 @@ function processGeom(geom, resolveBin) {
 		stripIndices
 	} = processPrimitives(geom.PrimitiveSetList, meta, resolveBin);
 
-	const totalIndexCount = triChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-	if (!totalIndexCount) return null;
-
-	const indices = new Uint32Array(totalIndexCount);
-	let offset = 0;
-	triChunks.forEach((chunk) => {
-		indices.set(chunk, offset);
-		offset += chunk.length;
-	});
+	const indices = concatIndices(triChunks);
+	if (!indices) return null;
 
 	const {
 		attrs,
@@ -326,27 +500,10 @@ function processGeom(geom, resolveBin) {
 		delete attrs[k];
 	}
 
-	// Link to the material via the StateSet: material name and/or the texture
-	// set uid referenced by the geometry (how the viewer picks each material).
-	let matName = null,
-		texSetUid = null;
-	const stateSet = geom.StateSet && (geom.StateSet['osg.StateSet'] || geom.StateSet);
-	if (stateSet) {
-		for (const attr of (stateSet.AttributeList || [])) {
-			if (attr['osg.Material'] && attr['osg.Material'].Name) {
-				matName = attr['osg.Material'].Name;
-			}
-		}
-		for (const unit of (stateSet.TextureAttributeList || [])) {
-			for (const texAttr of (unit || [])) {
-				const texFilePath = texAttr['osg.Texture'] && texAttr['osg.Texture'].File;
-				if (texFilePath) {
-					const texSetMatch = texFilePath.match(/textures\/([^/]+)\//);
-					if (texSetMatch) texSetUid = texSetMatch[1];
-				}
-			}
-		}
-	}
+	const {
+		matName,
+		texSetUid
+	} = resolveMaterialLink(geom);
 	return {
 		name: geom.Name || 'mesh',
 		indices,
@@ -365,8 +522,27 @@ function mat4mul(a, b) {
 	return r;
 }
 const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+/** Precomputed identity string for the memoized deep-equality check. */
+const IDENTITY_STRING = JSON.stringify(IDENTITY);
+/** True when `m` is null/undefined or exactly the 4×4 identity matrix. */
+const isIdentityMatrix = (m) => !m || JSON.stringify(m) === IDENTITY_STRING;
 
 // ─── GLB builder helpers ──────────────────────────────────────────────────────
+
+/**
+ * Pad a buffer to a 4-byte boundary, returning a new zero-filled buffer with
+ * the original bytes copied in. The padding size is computed explicitly as
+ * `(4 - (bytes.length % 4)) % 4`.
+ *
+ * @param {Buffer} bytes - Source bytes.
+ * @returns {Buffer} 4-byte-aligned buffer (length ≥ bytes.length).
+ */
+function padBuffer(bytes) {
+	const pad = (4 - (bytes.length % 4)) % 4;
+	const padded = Buffer.alloc(bytes.length + pad);
+	bytes.copy(padded);
+	return padded;
+}
 
 /**
  * Append a typed accessor (plus its bufferView and padded bytes) to the GLB
@@ -385,22 +561,9 @@ function addAccessor(builder, data, componentType, count, itemSize, normalized) 
 	const {
 		gltf
 	} = builder;
-	const typeMap = {
-		1: 'SCALAR',
-		2: 'VEC2',
-		3: 'VEC3',
-		4: 'VEC4'
-	};
-	const ctMap = {
-		[GLTF_COMPONENT_FLOAT]: Float32Array,
-		[GLTF_COMPONENT_UINT]: Uint32Array,
-		[GLTF_COMPONENT_USHORT]: Uint16Array,
-		[GLTF_COMPONENT_UBYTE]: Uint8Array
-	};
-	const buf = new(ctMap[componentType] || Float32Array)(data.buffer ? data : Array.from(data));
+	const buf = new(COMPONENT_TYPE_MAP[componentType] || Float32Array)(data.buffer ? data : Array.from(data));
 	const bytes = Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
-	const padded = Buffer.alloc(bytes.length + (4 - (bytes.length % 4)) % 4);
-	bytes.copy(padded);
+	const padded = padBuffer(bytes);
 
 	const bvIdx = gltf.bufferViews.length;
 	gltf.bufferViews.push({
@@ -409,30 +572,32 @@ function addAccessor(builder, data, componentType, count, itemSize, normalized) 
 		byteLength: bytes.length
 	});
 
-	// Compute min/max in a single pass, seeded from the first element.
-	const min = Array.from(buf.slice(0, itemSize));
-	const max = [...min];
-	for (let i = 1; i < count; i++) {
+	// Compute min/max in a single strided pass over the typed array.
+	const min = Array(itemSize).fill(Infinity);
+	const max = Array(itemSize).fill(-Infinity);
+	for (let i = 0; i < buf.length; i += itemSize) {
 		for (let j = 0; j < itemSize; j++) {
-			const v = buf[i * itemSize + j];
-			if (v < min[j]) min[j] = v;
-			if (v > max[j]) max[j] = v;
+			const value = buf[i + j];
+			if (value < min[j]) min[j] = value;
+			if (value > max[j]) max[j] = value;
 		}
 	}
 
-	const accIdx = gltf.accessors.length;
-	gltf.accessors.push({
+	const type = SIZE_TO_TYPE[itemSize] || 'SCALAR';
+	const accessor = {
 		bufferView: bvIdx,
 		byteOffset: 0,
 		componentType,
 		count,
-		type: typeMap[itemSize] || 'SCALAR',
+		type,
 		min,
-		max,
-		...(normalized ? {
-			normalized: true
-		} : {})
-	});
+		max
+	};
+	if (normalized) {
+		accessor.normalized = true;
+	}
+	const accIdx = gltf.accessors.length;
+	gltf.accessors.push(accessor);
 	builder.chunks.push(padded);
 	builder.byteOffset += padded.length;
 	return accIdx;
@@ -449,8 +614,7 @@ function addImage(builder, filePath) {
 	if (!existsSync(filePath)) return -1;
 	const imgData = readFileSync(filePath);
 	const mime = filePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
-	const padded = Buffer.alloc(Math.ceil(imgData.length / 4) * 4);
-	imgData.copy(padded);
+	const padded = padBuffer(imgData);
 	builder.gltf.bufferViews.push({
 		buffer: 0,
 		byteOffset: builder.byteOffset,
@@ -484,6 +648,246 @@ function addTexture(builder, filePath) {
 	return texIdx;
 }
 
+// ─── Scene-graph helpers (extracted from convertToGltf for testability) ───────
+
+/**
+ * Recursively walk the osgjs scene graph, collecting processed geometries.
+ *
+ * @param {object}   obj         - Current scene-graph node.
+ * @param {number[]} matrix      - Accumulated column-major parent transform.
+ * @param {object}   ctx         - `{ resolveBin }` context.
+ * @param {Map}      seen        - UniqueID → true for already-processed geometries.
+ * @param {Array}    geometries  - Output accumulator for processed geometry records.
+ */
+function traverse(obj, matrix, ctx, seen, geometries) {
+	if (!obj || typeof obj !== 'object') return;
+	const mt = obj['osg.MatrixTransform'];
+	if (mt && Array.isArray(mt.Matrix)) matrix = mat4mul(matrix, mt.Matrix);
+	if (obj['osg.Geometry']) {
+		const g = obj['osg.Geometry'];
+		const isLineOnly = (g.PrimitiveSetList || []).some(p => Object.values(p)[0] && Object.values(p)[0].Mode === 'LINES');
+		if (!isLineOnly) {
+			if (g.UniqueID === undefined || !seen.has(g.UniqueID)) {
+				if (g.UniqueID !== undefined) seen.set(g.UniqueID, true);
+				try {
+					const result = processGeom(g, ctx.resolveBin);
+					if (result && result.indices && result.attributes.POSITION) {
+						result.matrix = matrix;
+						geometries.push(result);
+					}
+				} catch (e) {
+					console.warn(`  Warning: ${g.Name}: ${e.message}`);
+				}
+			}
+		}
+	}
+	const children = (obj['osg.Node'] && obj['osg.Node'].Children) || (mt && mt.Children) || obj.Children;
+	if (children)
+		for (const child of children) traverse(child, matrix, ctx, seen, geometries);
+}
+
+/**
+ * Build a glTF mesh (one primitive) for a geometry, appending accessors.
+ *
+ * @param {object}   builder - GLB builder state.
+ * @param {object}   geom    - Processed geometry record from {@link traverse}.
+ * @param {Function} materialForGeom - Geometry → material index resolver.
+ * @returns {number} Index of the new mesh.
+ */
+function createMesh(builder, geom, materialForGeom) {
+	const prim = {
+		attributes: {},
+		material: materialForGeom(geom)
+	};
+	prim.indices = addAccessor(builder, geom.indices, geom.indices.BYTES_PER_ELEMENT === 4 ? GLTF_COMPONENT_UINT : GLTF_COMPONENT_USHORT, geom.indices.length, 1);
+	for (const [name, attr] of Object.entries(geom.attributes))
+		prim.attributes[name] = addAccessor(builder, attr.data, attr.componentType || GLTF_COMPONENT_FLOAT, attr.count, attr.itemSize, attr.normalized);
+	return builder.gltf.meshes.push({
+		primitives: [prim],
+		name: geom.name
+	}) - 1;
+}
+
+/**
+ * Build the scene node referencing a geometry's mesh, carrying its transform.
+ *
+ * @param {object} geom    - Processed geometry record.
+ * @param {number} meshIdx - Index of the mesh built by {@link createMesh}.
+ * @returns {object} The glTF node object.
+ */
+function createNode(geom, meshIdx) {
+	const node = {
+		mesh: meshIdx,
+		name: geom.name
+	};
+	if (!isIdentityMatrix(geom.matrix)) node.matrix = geom.matrix;
+	return node;
+}
+
+/**
+ * Pack a glTF JSON document and its binary buffer into a GLB container.
+ *
+ * @param {object} gltf       - The glTF JSON object.
+ * @param {Buffer} binBuffer  - Concatenated binary chunk.
+ * @returns {Buffer} Complete GLB file contents.
+ */
+function packGLB(gltf, binBuffer) {
+	const jsonBuf = Buffer.from(JSON.stringify(gltf));
+	const jsonPad = Buffer.alloc(Math.ceil(jsonBuf.length / 4) * 4, 0x20);
+	jsonBuf.copy(jsonPad);
+	const binPad = Buffer.alloc(Math.ceil(binBuffer.length / 4) * 4);
+	binBuffer.copy(binPad);
+
+	const header = Buffer.alloc(12);
+	header.writeUInt32LE(GLB_MAGIC, 0);
+	header.writeUInt32LE(GLB_VERSION, 4);
+	header.writeUInt32LE(12 + 8 + jsonPad.length + 8 + binPad.length, 8);
+	const jch = Buffer.alloc(8);
+	jch.writeUInt32LE(jsonPad.length, 0);
+	jch.writeUInt32LE(GLB_CHUNK_JSON, 4);
+	const bch = Buffer.alloc(8);
+	bch.writeUInt32LE(binPad.length, 0);
+	bch.writeUInt32LE(GLB_CHUNK_BIN, 4);
+
+	return Buffer.concat([header, jch, jsonPad, bch, binPad]);
+}
+
+// ─── Material pipeline helpers (extracted from convertToGltf) ────────────────
+
+/**
+ * Build the material-index pipeline for a conversion: one glTF material per
+ * source material, plus a geometry → material-index resolver.
+ *
+ * @param {object}   gltf             - The glTF document being built (materials appended).
+ * @param {object}   materialsClean   - Material name → channel map.
+ * @param {Function} addTextureCached - Texture file name → glTF texture index.
+ * @returns {{ materialForGeom: (geom: object) => number }}
+ */
+function buildMaterials(gltf, materialsClean, addTextureCached) {
+	// Source channel → builder for the material property it produces once its
+	// texture resolves (empty object when it doesn't).
+	const streamProps = {
+		base: (i) => ({
+			pbrMetallicRoughness: {
+				baseColorTexture: {
+					index: i
+				}
+			}
+		}),
+		mr: (i) => ({
+			pbrMetallicRoughness: {
+				metallicRoughnessTexture: {
+					index: i
+				}
+			}
+		}),
+		norm: (i) => ({
+			normalTexture: {
+				index: i,
+				scale: 1
+			}
+		}),
+		emit: (i) => ({
+			emissiveTexture: {
+				index: i
+			},
+			emissiveFactor: [1, 1, 1]
+		})
+	};
+
+	// Resolve a channel's texture to a glTF texture index (or -1 when the
+	// channel or its image is absent). Cached per file name by the caller's
+	// addTextureCached, so each image is resolved only once.
+	const resolveTexture = (src) => (src ? addTextureCached(src.cleanFile ?? src.filename) : -1);
+
+	function buildMaterial(name, chans) {
+		const {
+			AlbedoPBR: albedo = null,
+			MetalRough: mr = null,
+			MetalnessPBR = null,
+			NormalMap: norm = null,
+			EmitColor: emit = null
+		} = chans ?? {};
+		const srcByStream = {
+			base: albedo,
+			mr: mr ?? MetalnessPBR,
+			norm,
+			emit
+		};
+
+		const baseMat = {
+			name,
+			pbrMetallicRoughness: {
+				baseColorFactor: [1, 1, 1, 1],
+				metallicFactor: 1,
+				roughnessFactor: 1
+			}
+		};
+		// Gather every resolved texture's property object, then merge in one pass.
+		const propsArray = [];
+		for (const [stream, toProps] of Object.entries(streamProps)) {
+			const index = resolveTexture(srcByStream[stream]);
+			if (index >= 0) propsArray.push(toProps(index));
+		}
+		const mat = propsArray.reduce((acc, props) => ({
+			...acc,
+			...props,
+			pbrMetallicRoughness: {
+				...acc.pbrMetallicRoughness,
+				...(props.pbrMetallicRoughness || {})
+			}
+		}), baseMat);
+
+		gltf.materials.push(mat);
+		return gltf.materials.length - 1;
+	}
+
+	// materialsClean maps material name → channels. Match each geometry to its
+	// material via the StateSet (texture-set uid, then material name), falling
+	// back to the material name appearing in the geometry name.
+	const matNames = Object.keys(materialsClean);
+	const matIndex = Object.fromEntries(
+		matNames.map((n) => [n, buildMaterial(n, materialsClean[n])])
+	);
+	if (!matNames.length) matIndex['__default'] = buildMaterial('material', null);
+
+	const albedoToMat = {};
+	for (const [n, ch] of Object.entries(materialsClean))
+		if (ch.AlbedoPBR && ch.AlbedoPBR.setUid) albedoToMat[ch.AlbedoPBR.setUid] = n;
+
+	function resolveMaterial(geom) {
+		if (geom.texSetUid && albedoToMat[geom.texSetUid] !== undefined) return matIndex[albedoToMat[geom.texSetUid]];
+		if (geom.matName && matIndex[geom.matName] !== undefined) return matIndex[geom.matName];
+		for (const n of matNames)
+			if (n && geom.name && geom.name.indexOf(n) !== -1) return matIndex[n];
+		return Object.values(matIndex)[0] || 0;
+	}
+
+	return {
+		resolveMaterial
+	};
+}
+
+/**
+ * Wrap a geometry → material-index resolver with a per-geometry-UID cache so
+ * repeated lookups are constant-time.
+ *
+ * @param {(geom: object) => number} resolveMaterial - Uncached resolver.
+ * @returns {(geom: object) => number}
+ */
+function makeMaterialResolver(resolveMaterial) {
+	const geomIndexToMatIdx = new Map();
+	return (geom) => {
+		const key = geom.UniqueID ?? geom.name;
+		let idx = geomIndexToMatIdx.get(key);
+		if (idx === undefined) {
+			idx = resolveMaterial(geom);
+			geomIndexToMatIdx.set(key, idx);
+		}
+		return idx;
+	};
+}
+
 // ─── Exported converter ───────────────────────────────────────────────────────
 
 /**
@@ -506,40 +910,27 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, workDir) {
 	resolveRefs(osgjs, uidMap);
 
 	const geometries = [];
-	const seen = new Set();
+	// UniqueID → true; a Map leaves room to cache per-geometry state later
+	// without changing how reference handling works.
+	const seen = new Map();
 
-	// Resolve which binary buffer (poly vs. wireframe) a descriptor's File field
-	// refers to. Returns null when the required buffer was not provided.
-	const resolveBin = (fileStr) => fileStr && fileStr.includes('wireframe') ? wireBin : polyBin;
-
-	function traverse(obj, matrix) {
-		if (!obj || typeof obj !== 'object') return;
-		const mt = obj['osg.MatrixTransform'];
-		if (mt && Array.isArray(mt.Matrix)) matrix = mat4mul(matrix, mt.Matrix);
-		if (obj['osg.Geometry']) {
-			const g = obj['osg.Geometry'];
-			const isLineOnly = (g.PrimitiveSetList || []).some(p => Object.values(p)[0] && Object.values(p)[0].Mode === 'LINES');
-			if (!isLineOnly) {
-				if (g.UniqueID === undefined || !seen.has(g.UniqueID)) {
-					if (g.UniqueID !== undefined) seen.add(g.UniqueID);
-					try {
-						const result = processGeom(g, resolveBin);
-						if (result && result.indices && result.attributes.POSITION) {
-							result.matrix = matrix;
-							geometries.push(result);
-						}
-					} catch (e) {
-						console.warn(`  Warning: ${g.Name}: ${e.message}`);
-					}
-				}
-			}
+	// Cache the binary buffer each File field resolves to, keyed by the File
+	// string itself, so the wireframe check runs once per unique descriptor.
+	// Returns undefined when the required buffer was not provided.
+	const binByFile = new Map();
+	const resolveBin = (fileStr) => {
+		if (!fileStr) return undefined;
+		let bin = binByFile.get(fileStr);
+		if (bin === undefined) {
+			bin = fileStr.includes('wireframe') ? wireBin : polyBin;
+			binByFile.set(fileStr, bin);
 		}
-		const children = (obj['osg.Node'] && obj['osg.Node'].Children) || (mt && mt.Children) || obj.Children;
-		if (children)
-			for (const child of children) traverse(child, matrix);
-	}
+		return bin;
+	};
 
-	traverse(osgjs, IDENTITY);
+	traverse(osgjs, IDENTITY, {
+		resolveBin
+	}, seen, geometries);
 	console.log(`  ${geometries.length} geometries found`);
 
 	// Build GLB
@@ -561,10 +952,10 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, workDir) {
 		textures: [],
 		images: [],
 		samplers: [{
-			magFilter: GLTF_SAMPLER_LINEAR,
-			minFilter: GLTF_SAMPLER_LINEAR_MIPMAP,
-			wrapS: GLTF_WRAP_REPEAT,
-			wrapT: GLTF_WRAP_REPEAT
+			magFilter: MAG_FILTER,
+			minFilter: MIN_FILTER,
+			wrapS: WRAP_S,
+			wrapT: WRAP_T
 		}]
 	};
 
@@ -577,111 +968,32 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, workDir) {
 	};
 
 	// Build one glTF material per source material (each asteroid has its own atlas).
+	// addTextureCached memoizes on the texture file name so repeated references
+	// resolve (and hit the disk) only once.
 	const texDir = join(workDir, 'textures');
-	const texCache = {};
+	const texCache = new Map();
 
 	function addTextureCached(file) {
-		if (texCache[file] !== undefined) return texCache[file];
-		const idx = addTexture(builder, join(texDir, file));
-		texCache[file] = idx;
+		let idx = texCache.get(file);
+		if (idx === undefined) {
+			idx = addTexture(builder, join(texDir, file));
+			texCache.set(file, idx);
+		}
 		return idx;
 	}
 
-	function buildMaterial(name, chans) {
-		const {
-			AlbedoPBR: albedo,
-			MetalRough: mr,
-			MetalnessPBR,
-			NormalMap: norm,
-			EmitColor: emit
-		} = chans ?? {};
-
-		// Resolve each texture stream to a glTF texture index in one guarded call.
-		const addTex = (key) => (key ? addTextureCached(key.cleanFile ?? key.filename) : -1);
-		const iBase = addTex(albedo);
-		const iMr = addTex(mr ?? MetalnessPBR);
-		const iNorm = addTex(norm);
-		const iEmit = addTex(emit);
-
-		// Assemble the material in one expression, spreading each texture stream
-		// in only when its image resolved.
-		const mat = {
-			name,
-			pbrMetallicRoughness: {
-				baseColorFactor: [1, 1, 1, 1],
-				metallicFactor: 1,
-				roughnessFactor: 1,
-				...(iBase >= 0 && {
-					baseColorTexture: {
-						index: iBase
-					}
-				}),
-				...(iMr >= 0 && {
-					metallicRoughnessTexture: {
-						index: iMr
-					}
-				})
-			},
-			...(iNorm >= 0 && {
-				normalTexture: {
-					index: iNorm,
-					scale: 1
-				}
-			}),
-			...(iEmit >= 0 && {
-				emissiveTexture: {
-					index: iEmit
-				},
-				emissiveFactor: [1, 1, 1]
-			})
-		};
-
-		gltf.materials.push(mat);
-		return gltf.materials.length - 1;
-	}
-
-	// materialsClean maps material name → channels. Match each geometry to its
-	// material via the StateSet (texture-set uid, then material name), falling
-	// back to the material name appearing in the geometry name.
 	const materialsClean = textureFiles || {};
-	const matNames = Object.keys(materialsClean);
-	const matIndex = {};
-	for (const n of matNames) matIndex[n] = buildMaterial(n, materialsClean[n]);
-	if (!matNames.length) matIndex['__default'] = buildMaterial('material', null);
-
-	const albedoToMat = {};
-	for (const [n, ch] of Object.entries(materialsClean))
-		if (ch.AlbedoPBR && ch.AlbedoPBR.setUid) albedoToMat[ch.AlbedoPBR.setUid] = n;
-
-	function materialForGeom(geom) {
-		if (geom.texSetUid && albedoToMat[geom.texSetUid] !== undefined) return matIndex[albedoToMat[geom.texSetUid]];
-		if (geom.matName && matIndex[geom.matName] !== undefined) return matIndex[geom.matName];
-		for (const n of matNames)
-			if (n && geom.name && geom.name.indexOf(n) !== -1) return matIndex[n];
-		return Object.values(matIndex)[0] || 0;
-	}
+	const {
+		resolveMaterial
+	} = buildMaterials(gltf, materialsClean, addTextureCached);
+	const materialForGeom = makeMaterialResolver(resolveMaterial);
 
 	// Each geometry becomes its own mesh + node so it can carry its own transform
 	// matrix; otherwise every part (wheels, doors, …) collapses onto the origin.
-	const isIdentity = (m) => !m || m.every((v, i) => v === [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1][i]);
 	for (const geom of geometries) {
-		const prim = {
-			attributes: {},
-			material: materialForGeom(geom)
-		};
-		prim.indices = addAccessor(builder, geom.indices, geom.indices.BYTES_PER_ELEMENT === 4 ? GLTF_COMPONENT_UINT : GLTF_COMPONENT_USHORT, geom.indices.length, 1);
-		for (const [name, attr] of Object.entries(geom.attributes))
-			prim.attributes[name] = addAccessor(builder, attr.data, attr.componentType || GLTF_COMPONENT_FLOAT, attr.count, attr.itemSize, attr.normalized);
-		const meshIdx = gltf.meshes.push({
-			primitives: [prim],
-			name: geom.name
-		}) - 1;
-		const node = {
-			mesh: meshIdx,
-			name: geom.name
-		};
-		if (!isIdentity(geom.matrix)) node.matrix = geom.matrix;
-		gltf.scenes[0].nodes.push(gltf.nodes.push(node) - 1);
+		const meshIdx = createMesh(builder, geom, materialForGeom);
+		const nodeIdx = gltf.nodes.push(createNode(geom, meshIdx)) - 1;
+		gltf.scenes[0].nodes.push(nodeIdx);
 	}
 
 	const binBuffer = Buffer.concat(builder.chunks);
@@ -689,26 +1001,7 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, workDir) {
 		byteLength: binBuffer.length
 	});
 
-	// Write GLB
-	const jsonStr = JSON.stringify(gltf);
-	const jsonBuf = Buffer.from(jsonStr);
-	const jsonPad = Buffer.alloc(Math.ceil(jsonBuf.length / 4) * 4, 0x20);
-	jsonBuf.copy(jsonPad);
-	const binPad = Buffer.alloc(Math.ceil(binBuffer.length / 4) * 4);
-	binBuffer.copy(binPad);
-
-	const header = Buffer.alloc(12);
-	header.writeUInt32LE(GLB_MAGIC, 0);
-	header.writeUInt32LE(GLB_VERSION, 4);
-	header.writeUInt32LE(12 + 8 + jsonPad.length + 8 + binPad.length, 8);
-	const jch = Buffer.alloc(8);
-	jch.writeUInt32LE(jsonPad.length, 0);
-	jch.writeUInt32LE(GLB_CHUNK_JSON, 4);
-	const bch = Buffer.alloc(8);
-	bch.writeUInt32LE(binPad.length, 0);
-	bch.writeUInt32LE(GLB_CHUNK_BIN, 4);
-
-	return Buffer.concat([header, jch, jsonPad, bch, binPad]);
+	return packGLB(gltf, binBuffer);
 }
 
 export default {

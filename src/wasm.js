@@ -385,6 +385,32 @@ function* chunkSlices(input, chunkSize) {
 }
 
 /**
+ * Feed one input slice through the WASM decryptor and collect its output
+ * chunks. A single cached memory snapshot (`mem`) is reused for all reads,
+ * avoiding repeated `getMemory()` calls / JS↔WASM boundary crossings.
+ *
+ * @param {object}     wasm     - Object returned by {@link initWasm}.
+ * @param {Uint8Array} slice    - Input bytes for this iteration.
+ * @param {object}     exports  - Resolved WASM exports ({@link resolveWasmExports}).
+ * @param {Buffer[]}   chunks   - Output accumulator.
+ * @param {boolean[]}  gzipFlag - Single-element out-flag set on the first chunk.
+ */
+function decryptSlice(wasm, slice, exports, chunks, gzipFlag) {
+	const mem = wasm.getMemory();
+	const iOff = exports.allocInput(slice.length);
+	mem.set(slice, iOff);
+	let more = exports.process(1);
+	while (more) {
+		const s = exports.getOutputStart();
+		const chunkLen = exports.getOutputSize();
+		if (!chunks.length && chunkLen >= 2) gzipFlag[0] = mem[s] === 0x1f && mem[s + 1] === 0x8b;
+		chunks.push(Buffer.from(mem.buffer, s, chunkLen));
+		exports.advance();
+		more = exports.process(0);
+	}
+}
+
+/**
  * Decrypts a .binz file using the WASM decryptor and returns the decrypted bytes.
  * If the decrypted output is gzip-compressed (magic bytes 0x1f 0x8b), it is
  * automatically gunzipped before returning.
@@ -398,16 +424,13 @@ function* chunkSlices(input, chunkSize) {
 async function decryptBinz(binzPath, diterB, staticKey, wasmPath) {
 	const encData = readFileSync(binzPath);
 	const wasm = await initWasm(wasmPath);
+	const exports = resolveWasmExports(wasm.exports);
 	const {
-		allocInput,
 		reset,
 		setupKey,
 		allocDiterB,
-		process: processChunk,
-		advance,
-		getOutputSize,
-		getOutputStart
-	} = resolveWasmExports(wasm.exports);
+		process: processChunk
+	} = exports;
 
 	// ── Phase 1: Derive 10 key words from the static SHA-1 hex key ──────────
 	const keyHex = (staticKey || STATIC_KEY).slice(0, 40).toLowerCase();
@@ -425,22 +448,17 @@ async function decryptBinz(binzPath, diterB, staticKey, wasmPath) {
 	wasm.getMemory().set(diterBBytes, dOff);
 	processChunk(0);
 
-	const input = new Uint8Array(encData);
+	// Decrypt the payload in fixed-size slices, feeding each through the WASM
+	// decryptor. `encData` is a Buffer; slicing it directly avoids an extra
+	// Uint8Array copy. The gzip magic is sniffed from the first output chunk so
+	// we don't have to re-scan the concatenated result.
 	const chunks = [];
-	for (const slice of chunkSlices(input, DECRYPT_CHUNK_SIZE)) {
-		const iOff = allocInput(slice.length);
-		wasm.getMemory().set(slice, iOff);
-		let more = processChunk(1);
-		while (more) {
-			const mem = wasm.getMemory();
-			const s = getOutputStart();
-			chunks.push(Buffer.from(mem.subarray(s, s + getOutputSize())));
-			advance();
-			more = processChunk(0);
-		}
+	const gzipFlag = [false];
+	for (const slice of chunkSlices(encData, DECRYPT_CHUNK_SIZE)) {
+		decryptSlice(wasm, slice, exports, chunks, gzipFlag);
 	}
 	let result = Buffer.concat(chunks);
-	if (result[0] === 0x1f && result[1] === 0x8b) {
+	if (gzipFlag[0]) {
 		result = gunzipSync(result);
 	}
 	return result;

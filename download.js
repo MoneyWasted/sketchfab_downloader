@@ -41,13 +41,14 @@ const {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const __dirname = import.meta.dirname;
-let WORK_DIR = join(__dirname, '.cache');
+/** Absolute path where the extracted decrypt.wasm is cached. */
+const WASM_PATH = join(__dirname, 'decrypt.wasm');
 
 // ─── Step 2: Download files ───────────────────────────────────────────────────
 
-async function downloadFiles(config) {
+async function downloadFiles(config, workDir) {
 	console.log(`[2/6] Downloading model files...`);
-	mkdirSync(join(WORK_DIR, 'textures'), {
+	mkdirSync(join(workDir, 'textures'), {
 		recursive: true
 	});
 
@@ -58,7 +59,7 @@ async function downloadFiles(config) {
 	};
 
 	for (const [name, url] of Object.entries(files)) {
-		const dest = join(WORK_DIR, name);
+		const dest = join(workDir, name);
 		if (!existsSync(dest)) {
 			const data = await fetch(url);
 			writeFileSync(dest, data);
@@ -74,7 +75,7 @@ async function downloadFiles(config) {
 		for (const [channelName, tex] of Object.entries(channelMap)) {
 			if (seen.has(tex.filename)) continue;
 			seen.add(tex.filename);
-			const dest = join(WORK_DIR, 'textures', tex.filename);
+			const dest = join(workDir, 'textures', tex.filename);
 			if (!existsSync(dest)) {
 				const data = await fetch(tex.url);
 				writeFileSync(dest, data);
@@ -84,19 +85,15 @@ async function downloadFiles(config) {
 	}
 }
 
-// ─── Step 2.5: Extract decrypt.wasm from viewer JS ───────────────────────────
-
-const WASM_PATH = join(__dirname, 'decrypt.wasm');
-
 // ─── Step 3: WASM decryption ──────────────────────────────────────────────────
 
-async function decryptAll(config) {
+async function decryptAll(config, workDir) {
 	console.log(`[3/6] Decrypting model files...`);
 	const names = ['file.binz', 'model_file.binz', 'model_file_wireframe.binz'];
 	const outputs = ['file.osgjs', 'model_file.bin', 'model_file_wireframe.bin'];
 	for (let i = 0; i < names.length; i++) {
-		const src = join(WORK_DIR, names[i]);
-		const dst = join(WORK_DIR, outputs[i]);
+		const src = join(workDir, names[i]);
+		const dst = join(workDir, outputs[i]);
 		if (existsSync(dst)) continue;
 		const result = await decryptBinz(src, config.diterB, config.staticKey, WASM_PATH);
 		writeFileSync(dst, result);
@@ -104,26 +101,57 @@ async function decryptAll(config) {
 	}
 }
 
-// ─── Step 5: osgjs → glTF conversion ─────────────────────────────────────────
+// ─── Argument parsing ─────────────────────────────────────────────────────────
+
+/** Error raised when the user supplies an argument without a valid model UID. */
+class UsageError extends Error {}
+
+/**
+ * Validate that a string contains a 32-character hex Sketchfab model UID.
+ *
+ * @param {string} arg - URL or raw UID supplied on the command line.
+ * @returns {string} The extracted UID.
+ * @throws {UsageError} When no UID can be found in `arg`.
+ */
+function validateUid(arg) {
+	const uidMatch = arg.match(/([a-f0-9]{32})/);
+	if (!uidMatch) {
+		throw new UsageError('Could not extract model UID from: ' + arg);
+	}
+	return uidMatch[1];
+}
+
+/**
+ * Parse and validate command-line arguments.
+ *
+ * @param {string[]} argv - `process.argv`.
+ * @returns {{ uid: string, outputPath: string, workDir: string }}
+ * @throws {UsageError} When the model argument is missing or invalid.
+ */
+function parseArgs(argv) {
+	const arg = argv[2];
+	if (!arg) {
+		throw new UsageError(
+			'Usage: node download.js <sketchfab_url_or_uid> [output.glb]\n' +
+			'Example: node download.js https://sketchfab.com/3d-models/retro-futuristic-car-1d98d7d5c12b4ad591c7efeeb35f6278'
+		);
+	}
+	const uid = validateUid(arg);
+	return {
+		uid,
+		outputPath: argv[3] || `${uid}.glb`,
+		workDir: join(__dirname, '.cache', uid)
+	};
+}
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-	const arg = process.argv[2];
-	if (!arg) {
-		console.log('Usage: node download.js <sketchfab_url_or_uid> [output.glb]');
-		console.log('Example: node download.js https://sketchfab.com/3d-models/retro-futuristic-car-1d98d7d5c12b4ad591c7efeeb35f6278');
-		process.exit(1);
-	}
-
-	const uidMatch = arg.match(/([a-f0-9]{32})/);
-	if (!uidMatch) {
-		console.error('Could not extract model UID from:', arg);
-		process.exit(1);
-	}
-	const uid = uidMatch[1];
-	WORK_DIR = join(__dirname, '.cache', uid);
-	const outputPath = process.argv[3] || `${uid}.glb`;
+	const {
+		uid,
+		outputPath,
+		workDir
+	} = parseArgs(process.argv);
 
 	console.log(`Sketchfab Downloader — Model: ${uid}\n`);
 
@@ -134,29 +162,31 @@ async function main() {
 	await ensureWasm(config.html, WASM_PATH);
 	config.staticKey = await extractStaticKey(config.html);
 
-	await downloadFiles(config);
-	await decryptAll(config);
+	await downloadFiles(config, workDir);
+	await decryptAll(config, workDir);
 
 	let textureFiles = config.textureMap;
 	try {
-		textureFiles = await descrambleTextures(config, WORK_DIR);
+		textureFiles = await descrambleTextures(config, workDir);
 	} catch (e) {
 		console.warn(`  Texture descramble failed: ${e.message}`);
 	}
 
-	const osgjsData = JSON.parse(readFileSync(join(WORK_DIR, 'file.osgjs'), 'utf8'));
-	const polyBin = readFileSync(join(WORK_DIR, 'model_file.bin'));
+	const osgjsData = JSON.parse(readFileSync(join(workDir, 'file.osgjs'), 'utf8'));
+	const polyBin = readFileSync(join(workDir, 'model_file.bin'));
 	let wireBin = null;
-	const wirePath = join(WORK_DIR, 'model_file_wireframe.bin');
+	const wirePath = join(workDir, 'model_file_wireframe.bin');
 	if (existsSync(wirePath)) wireBin = readFileSync(wirePath);
 
-	const glb = convertToGltf(osgjsData, polyBin, wireBin, textureFiles, WORK_DIR);
+	const glb = convertToGltf(osgjsData, polyBin, wireBin, textureFiles, workDir);
 
 	writeFileSync(outputPath, glb);
 	console.log(`\n[6/6] Done! ${outputPath} (${(glb.length / 1024 / 1024).toFixed(1)} MB)`);
 }
 
 main().catch(e => {
-	console.error('Error:', e.message);
+	// Usage problems print a friendly message; unexpected errors print with context.
+	if (e instanceof UsageError) console.log(e.message);
+	else console.error('Error:', e.message);
 	process.exit(1);
 });

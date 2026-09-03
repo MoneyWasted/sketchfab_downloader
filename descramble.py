@@ -122,6 +122,98 @@ def xy_to_zigzag(y, t, pos):
     return triangle_sum(y, t, v) + e - s - 1
 
 
+_TRIANGLE_SUM_CACHE = {}
+
+
+def _triangle_sum_cached(y, t, f_):
+    """Return ``triangle_sum(y, t, f_)``, memoizing repeated evaluations.
+
+    The descramble hot path calls :func:`triangle_sum` many times with the
+    same block dimensions; caching keeps the per-pixel cost constant.
+    """
+    key = (y, t, f_)
+    try:
+        return _TRIANGLE_SUM_CACHE[key]
+    except KeyError:
+        value = triangle_sum(y, t, f_)
+        _TRIANGLE_SUM_CACHE[key] = value
+        return value
+
+
+def _floor_sqrt(n):
+    """Return the floor of the square root of non-negative integer ``n``.
+
+    Delegates to :func:`math.isqrt` (exact, integer-only) — no floating-point
+    rounding and no ``1e-6`` style epsilon hacks.
+    """
+    return math.isqrt(n)
+
+
+def _diag_index_first(x):
+    """Return the diagonal index for a zigzag index in the leading triangle.
+
+    Integer-only inverse of the triangular-number formula, replacing the old
+    ``1e-6`` float adjustment: the largest ``n`` with ``n(n+1)/2 <= x``.
+    """
+    return (_floor_sqrt(8 * x + 1) - 1) // 2
+
+
+def _diag_index_tail(m):
+    """Return the diagonal index for the mirrored tail triangle.
+
+    Integer-only equivalent of the original float expression
+    ``int((-1 + math.sqrt(8*m + 1)) // 1) // 2`` — i.e. ``(isqrt(8m+1)-1)//2``.
+    ``math.sqrt`` rounds down at perfect squares, so the floor (not ceiling)
+    form reproduces it exactly; the ``m <= 0`` guard matches the boundary.
+    """
+    d = 8 * m + 1
+    if d <= 0:
+        return 0
+    return (_floor_sqrt(d) - 1) // 2
+
+
+def _to_xy_case1(y, t, x, v, r):
+    """Leading triangular region (``x < threshold1``) of the zigzag grid."""
+    n = _diag_index_first(x)
+    h = x - _triangle_sum_cached(y, t, n)
+    if mod(n, 2) == 0:
+        return (h, n - h)
+    return (n - h, h)
+
+
+def _to_xy_case2(y, t, x, v, r, threshold1):
+    """Middle rectangular region (``threshold1 <= x < threshold2``)."""
+    x2 = x - threshold1
+    n = v + x2 // v
+    s = mod(x2, v)
+    h = mod(n, 2) == 0
+    g = n - v + s + 1
+    e = v - s - 1
+    S = n - s
+    T = s
+    if y > t:
+        if h:
+            return (g, e)
+        return (S, T)
+    if h:
+        return (T, S)
+    return (e, g)
+
+
+def _to_xy_case3(y, t, x, v, r, threshold2):
+    """Trailing triangular region (``x >= threshold2``) of the zigzag grid."""
+    n2 = v * (v - 1) // 2 - (x - threshold2) - 1
+    s2 = _diag_index_tail(n2)
+    n = r + v - s2 - 2
+    h2 = x - _triangle_sum_cached(y, t, n)
+    g2 = mod(n, 2) == 0
+    e2 = v + r - n - 1
+    if g2:
+        h2 = e2 - h2 - 1
+    S2 = n + h2 - y + 1
+    return (n - S2, S2)
+
+
 def zigzag_to_xy(y, t, x):
     """Convert a scalar zigzag index back to its 2-D tile coordinate.
 
@@ -142,40 +234,10 @@ def zigzag_to_xy(y, t, x):
     threshold2 = threshold1 + v * (r - v)
 
     if x < threshold1:
-        n = int((-1 + (1e-6 + math.sqrt(8 * x + 1))) // 1) // 2
-        h = x - triangle_sum(y, t, n)
-        s = mod(n, 2) == 0
-        if s:
-            return (h, n - h)
-        return (n - h, h)
-
+        return _to_xy_case1(y, t, x, v, r)
     if x < threshold2:
-        x2 = x - threshold1
-        n = v + x2 // v
-        s = mod(x2, v)
-        h = mod(n, 2) == 0
-        g = n - v + s + 1
-        e = v - s - 1
-        S = n - s
-        T = s
-        if y > t:
-            if h:
-                return (g, e)
-            return (S, T)
-        if h:
-            return (T, S)
-        return (e, g)
-
-    n2 = v * (v - 1) // 2 - (x - threshold2) - 1
-    s2 = int((-1 + math.sqrt(8 * n2 + 1)) // 1) // 2
-    n = r + v - s2 - 2
-    h2 = x - triangle_sum(y, t, n)
-    g2 = mod(n, 2) == 0
-    e2 = v + r - n - 1
-    if g2:
-        h2 = e2 - h2 - 1
-    S2 = n + h2 - y + 1
-    return (n - S2, S2)
+        return _to_xy_case2(y, t, x, v, r, threshold1)
+    return _to_xy_case3(y, t, x, v, r, threshold2)
 
 
 def pixel_to_block_index(vx, vy, block_w, block_h):
