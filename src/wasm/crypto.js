@@ -105,15 +105,22 @@ function* chunkSlices(input, chunkSize) {
  * @param {boolean[]}  gzipFlag - Single-element out-flag set on the first chunk.
  */
 function decryptSlice(wasm, slice, exports, chunks, gzipFlag) {
-	const mem = wasm.getMemory();
+	let mem = wasm.getMemory();
 	const iOff = exports.allocInput(slice.length);
+	// Re-fetch after allocInput in case sbrk grew the memory.
+	mem = wasm.getMemory();
 	mem.set(slice, iOff);
 	let more = exports.process(1);
 	while (more) {
+		// Re-fetch after each process/advance in case sbrk grew the memory.
+		mem = wasm.getMemory();
 		const s = exports.getOutputStart();
 		const chunkLen = exports.getOutputSize();
 		if (!chunks.length && chunkLen >= 2) gzipFlag[0] = mem[s] === 0x1f && mem[s + 1] === 0x8b;
-		chunks.push(Buffer.from(mem.buffer, s, chunkLen));
+		// Copy immediately — Buffer.from(arrayBuffer, offset, len) is a zero-copy
+		// view. If a later sbrk() grows memory the backing ArrayBuffer is detached
+		// and the view silently reads as zeros, corrupting earlier chunks.
+		chunks.push(Buffer.from(mem.subarray(s, s + chunkLen)));
 		exports.advance();
 		more = exports.process(0);
 	}

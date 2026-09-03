@@ -11,7 +11,9 @@ import {
 	mkdirSync,
 	existsSync,
 	writeFileSync,
-	readFileSync
+	readFileSync,
+	renameSync,
+	unlinkSync
 } from 'fs';
 import {
 	join
@@ -96,7 +98,16 @@ async function decryptAll(config, workDir) {
 		const dst = join(workDir, outputs[i]);
 		if (existsSync(dst)) continue;
 		const result = await decryptBinz(src, config.diterB, config.staticKey, WASM_PATH);
-		writeFileSync(dst, result);
+		// Write atomically: commit via rename so a crash never leaves a partial file
+		// that would be silently reused on the next run.
+		const tmp = dst + '.tmp';
+		try {
+			writeFileSync(tmp, result);
+			renameSync(tmp, dst);
+		} catch (e) {
+			try { unlinkSync(tmp); } catch {}
+			throw e;
+		}
 		console.log(`  ${outputs[i]}: ${result.length} bytes`);
 	}
 }
