@@ -11,7 +11,7 @@ import {
 import {
 	STATIC_KEY,
 	decryptBinz
-} from './src/wasm';
+} from './src/wasm/index.js';
 import {
 	getModelConfig
 } from './src/config';

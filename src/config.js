@@ -13,7 +13,7 @@ const {
 	fetch,
 	fetchText
 } = _network;
-import _wasm from './wasm.js';
+import _wasm from './wasm/index.js';
 const {
 	STATIC_KEY
 } = _wasm;

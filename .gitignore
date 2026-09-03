@@ -4,8 +4,6 @@ __pycache__/
 
 # Working cache (per-model downloads, decrypted files, descrambled textures)
 .cache/
-model/
-textures/
 
 # Cached viewer JS bundles and deobfuscated output (RE artifacts)
 viewer_js/

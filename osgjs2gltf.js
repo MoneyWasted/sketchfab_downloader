@@ -8,7 +8,7 @@ import {
 } from 'path';
 import {
 	convertToGltf
-} from './src/gltf';
+} from './src/gltf/index.js';
 
 // --- Main ---
 

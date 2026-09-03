@@ -20,7 +20,7 @@ import _network from './src/network.js';
 const {
 	fetch
 } = _network;
-import _wasm from './src/wasm.js';
+import _wasm from './src/wasm/index.js';
 const {
 	decryptBinz
 } = _wasm;
@@ -30,11 +30,11 @@ const {
 	ensureWasm,
 	extractStaticKey
 } = _config;
-import _textures from './src/textures.js';
+import _textures from './src/textures/index.js';
 const {
 	descrambleTextures
 } = _textures;
-import _gltf from './src/gltf.js';
+import _gltf from './src/gltf/index.js';
 const {
 	convertToGltf
 } = _gltf;
