@@ -11,7 +11,9 @@ import {
 	WASM_EXPORTS,
 	DECRYPT_CHUNK_SIZE,
 } from './constants.js';
-import { initWasm } from './runtime.js';
+import {
+	initWasm
+} from './runtime.js';
 
 /**
  * Resolved WASM exports, memoized per exports object so repeated decryptions

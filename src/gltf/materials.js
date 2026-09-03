@@ -1,7 +1,11 @@
 'use strict';
 
-import { join } from 'path';
-import { addTexture } from './glbBuilder.js';
+import {
+	join
+} from 'path';
+import {
+	addTexture
+} from './glbBuilder.js';
 
 // ─── Material pipeline helpers ────────────────────────────────────────────────
 

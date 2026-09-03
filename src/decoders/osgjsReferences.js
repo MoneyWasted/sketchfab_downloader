@@ -39,4 +39,7 @@ function resolveRefs(obj, uidMap) {
 	return obj;
 }
 
-export { buildUidMap, resolveRefs };
+export {
+	buildUidMap,
+	resolveRefs
+};

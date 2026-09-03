@@ -1,7 +1,12 @@
 'use strict';
 
-import { processPrimitives, concatIndices } from './geometryIndices.js';
-import { processVertexAttributes } from './geometryAttributes.js';
+import {
+	processPrimitives,
+	concatIndices
+} from './geometryIndices.js';
+import {
+	processVertexAttributes
+} from './geometryAttributes.js';
 
 /**
  * Flatten a geometry's UserDataContainer values into a plain metadata object,

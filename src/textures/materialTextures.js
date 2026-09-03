@@ -1,4 +1,7 @@
-import { makeTexturePath, pathExists } from './imageCodec.js';
+import {
+	makeTexturePath,
+	pathExists
+} from './imageCodec.js';
 
 /**
  * Pick the materials map to process: the per-material map when present and

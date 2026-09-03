@@ -1,7 +1,12 @@
 'use strict';
 
-import { processGeom } from './geometry.js';
-import { buildUidMap, resolveRefs } from './codecs.js';
+import {
+	processGeom
+} from './geometry.js';
+import {
+	buildUidMap,
+	resolveRefs
+} from './codecs.js';
 
 // Multiply two column-major 4x4 matrices (parent * child).
 export function mat4mul(a, b) {

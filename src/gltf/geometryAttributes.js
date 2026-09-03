@@ -6,7 +6,9 @@ import {
 	parallelogramPredict,
 	readBuf
 } from './codecs.js';
-import { GLTF_COMPONENT_UBYTE } from './constants.js';
+import {
+	GLTF_COMPONENT_UBYTE
+} from './constants.js';
 
 // ─── Vertex-attribute helpers ─────────────────────────────────────────────────
 

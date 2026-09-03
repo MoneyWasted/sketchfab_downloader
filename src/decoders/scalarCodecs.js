@@ -100,4 +100,8 @@ function readBuf(bin, vb, itemSize, typeName) {
 	return new types[typeName](bin, off, size * itemSize);
 }
 
-export { decodeVarint, deltaDecode, readBuf };
+export {
+	decodeVarint,
+	deltaDecode,
+	readBuf
+};

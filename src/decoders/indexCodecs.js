@@ -112,4 +112,10 @@ function looseToTris(indices) {
 	return new Uint32Array(tris);
 }
 
-export { implicitDecode, expectedRenumber, widenIndices, stripToTris, looseToTris };
+export {
+	implicitDecode,
+	expectedRenumber,
+	widenIndices,
+	stripToTris,
+	looseToTris
+};

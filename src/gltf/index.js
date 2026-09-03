@@ -1,8 +1,12 @@
 'use strict';
 
-import { convertToGltf } from './converter.js';
+import {
+	convertToGltf
+} from './converter.js';
 
-export { convertToGltf };
+export {
+	convertToGltf
+};
 
 export default {
 	convertToGltf

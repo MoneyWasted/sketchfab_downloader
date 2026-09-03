@@ -1,7 +1,21 @@
-import { BLOCK_SIZE, idiv, pixelToFlat, flatToPixel } from './scrambleMath.js';
-import { getImageProcessors } from './imageCodec.js';
-import { createDecodeCache, createDescrambler } from './textureCache.js';
-import { selectMaterials, processChannels, combineMetalRough } from './materialTextures.js';
+import {
+	BLOCK_SIZE,
+	idiv,
+	pixelToFlat,
+	flatToPixel
+} from './scrambleMath.js';
+import {
+	getImageProcessors
+} from './imageCodec.js';
+import {
+	createDecodeCache,
+	createDescrambler
+} from './textureCache.js';
+import {
+	selectMaterials,
+	processChannels,
+	combineMetalRough
+} from './materialTextures.js';
 
 /**
  * Descrambles a single raw pixel buffer using the Sketchfab zigzag permutation.

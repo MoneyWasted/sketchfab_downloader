@@ -1,9 +1,19 @@
 'use strict';
 
-import { extractGeometries } from './scene.js';
-import { buildGltfBase, createMesh, finalizeGLB } from './glbBuilder.js';
-import { createNode } from './scene.js';
-import { prepareMaterials } from './materials.js';
+import {
+	extractGeometries
+} from './scene.js';
+import {
+	buildGltfBase,
+	createMesh,
+	finalizeGLB
+} from './glbBuilder.js';
+import {
+	createNode
+} from './scene.js';
+import {
+	prepareMaterials
+} from './materials.js';
 
 // ─── Exported converter ───────────────────────────────────────────────────────
 

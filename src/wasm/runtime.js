@@ -9,7 +9,9 @@ import {
 	WASM_PAGE_SIZE,
 	WASM_MEM_OVERHEAD,
 } from './constants.js';
-import { parseWasmDataSize } from './parser.js';
+import {
+	parseWasmDataSize
+} from './parser.js';
 
 /**
  * Allocate the WebAssembly.Memory for the decrypt module.

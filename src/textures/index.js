@@ -1,4 +1,7 @@
-import { descrambleTexture, descrambleTextures } from './descramble.js';
+import {
+	descrambleTexture,
+	descrambleTextures
+} from './descramble.js';
 
 export default {
 	descrambleTexture,

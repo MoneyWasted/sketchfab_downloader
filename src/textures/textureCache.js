@@ -1,4 +1,8 @@
-import { makeTexturePath, makeCleanName, pathExists } from './imageCodec.js';
+import {
+	makeTexturePath,
+	makeCleanName,
+	pathExists
+} from './imageCodec.js';
 
 /**
  * Create a memoized raw-image decoder for a working directory. Decoded raw
