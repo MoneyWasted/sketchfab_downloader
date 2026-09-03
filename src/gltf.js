@@ -692,7 +692,7 @@ function traverse(obj, matrix, ctx, seen, geometries) {
  * @param {object}   builder - GLB builder state.
  * @param {object}   geom    - Processed geometry record from {@link traverse}.
  * @param {Function} materialForGeom - Geometry → material index resolver.
- * @returns {number} Index of the new mesh.
+ * @returns {object} The new glTF mesh object (caller appends it to gltf.meshes).
  */
 function createMesh(builder, geom, materialForGeom) {
 	const prim = {
@@ -702,10 +702,10 @@ function createMesh(builder, geom, materialForGeom) {
 	prim.indices = addAccessor(builder, geom.indices, geom.indices.BYTES_PER_ELEMENT === 4 ? GLTF_COMPONENT_UINT : GLTF_COMPONENT_USHORT, geom.indices.length, 1);
 	for (const [name, attr] of Object.entries(geom.attributes))
 		prim.attributes[name] = addAccessor(builder, attr.data, attr.componentType || GLTF_COMPONENT_FLOAT, attr.count, attr.itemSize, attr.normalized);
-	return builder.gltf.meshes.push({
+	return {
 		primitives: [prim],
 		name: geom.name
-	}) - 1;
+	};
 }
 
 /**
@@ -752,7 +752,177 @@ function packGLB(gltf, binBuffer) {
 	return Buffer.concat([header, jch, jsonPad, bch, binPad]);
 }
 
+/**
+ * Build the empty glTF 2.0 document skeleton (asset, scene, and the shared
+ * default sampler) that geometries, materials, and accessors are added to.
+ *
+ * @returns {object} The initial glTF structure.
+ */
+function buildGltfBase() {
+	return {
+		asset: {
+			version: '2.0',
+			generator: 'sketchfab-downloader'
+		},
+		scene: 0,
+		scenes: [{
+			nodes: []
+		}],
+		nodes: [],
+		meshes: [],
+		accessors: [],
+		bufferViews: [],
+		buffers: [],
+		materials: [],
+		textures: [],
+		images: [],
+		samplers: [{
+			magFilter: MAG_FILTER,
+			minFilter: MIN_FILTER,
+			wrapS: WRAP_S,
+			wrapT: WRAP_T
+		}]
+	};
+}
+
 // ─── Material pipeline helpers (extracted from convertToGltf) ────────────────
+
+/**
+ * Source channel → builder for the material property it produces once its
+ * texture resolves. Module-level so it is created once, not per call.
+ */
+const streamProps = {
+	base: (i) => ({
+		pbrMetallicRoughness: {
+			baseColorTexture: {
+				index: i
+			}
+		}
+	}),
+	mr: (i) => ({
+		pbrMetallicRoughness: {
+			metallicRoughnessTexture: {
+				index: i
+			}
+		}
+	}),
+	norm: (i) => ({
+		normalTexture: {
+			index: i,
+			scale: 1
+		}
+	}),
+	emit: (i) => ({
+		emissiveTexture: {
+			index: i
+		},
+		emissiveFactor: [1, 1, 1]
+	})
+};
+
+/** Precomputed [stream, toProps] pairs so per-material work skips re-deriving them. */
+const streamPropEntries = Object.entries(streamProps);
+
+/**
+ * Memoizing texture-file → glTF texture index cache. Resolves (and reads from
+ * disk) each image file only once per conversion.
+ */
+class TextureCache {
+	/**
+	 * @param {object} builder - GLB builder state (see {@link addAccessor}).
+	 * @param {string} texDir  - Directory holding the texture images.
+	 */
+	constructor(builder, texDir) {
+		this.builder = builder;
+		this.texDir = texDir;
+		this.map = new Map();
+	}
+
+	/** Resolve a texture file name to its glTF texture index (memoized). */
+	get(file) {
+		let idx = this.map.get(file);
+		if (idx === undefined) {
+			idx = addTexture(this.builder, join(this.texDir, file));
+			this.map.set(file, idx);
+		}
+		return idx;
+	}
+}
+
+/**
+ * Memoizing texture resolver for a conversion: each channel's texture resolves
+ * to a glTF texture index (or -1 when the channel/image is absent), cached by
+ * the source string so each distinct texture resolves exactly once.
+ *
+ * @param {Function} addTextureCached - Texture file name → glTF texture index.
+ * @returns {(src: object|null) => number}
+ */
+function createTextureResolver(addTextureCached) {
+	const resolveCache = new Map();
+	return (src) => {
+		if (!src) return -1;
+		const key = src.cleanFile ?? src.filename;
+		let idx = resolveCache.get(key);
+		if (idx === undefined) {
+			idx = addTextureCached(key);
+			resolveCache.set(key, idx);
+		}
+		return idx;
+	};
+}
+
+/**
+ * Build one glTF material from a channel map and append it to `gltf.materials`.
+ *
+ * @param {object}   gltf           - The glTF document being built.
+ * @param {Function} resolveTexture - Channel source → glTF texture index.
+ * @param {string}   name           - Material name.
+ * @param {object}   chans          - Channel map (AlbedoPBR, MetalRough, …).
+ * @returns {number} Index of the new material.
+ */
+function buildMaterial(gltf, resolveTexture, name, chans) {
+	const {
+		AlbedoPBR: albedo = null,
+		MetalRough: mr = null,
+		MetalnessPBR = null,
+		NormalMap: norm = null,
+		EmitColor: emit = null
+	} = chans ?? {};
+	const srcByStream = {
+		base: albedo,
+		mr: mr ?? MetalnessPBR,
+		norm,
+		emit
+	};
+
+	// Build the material in one pass: flatten the pbrMetallicRoughness and
+	// top-level stream properties into two accumulators, then assemble.
+	const baseMat = {
+		name,
+		pbrMetallicRoughness: {
+			baseColorFactor: [1, 1, 1, 1],
+			metallicFactor: 1,
+			roughnessFactor: 1
+		}
+	};
+	const pbrProps = {};
+	const otherProps = {};
+	for (const [stream, toProps] of streamPropEntries) {
+		const index = resolveTexture(srcByStream[stream]);
+		if (index < 0) continue;
+		const {
+			pbrMetallicRoughness,
+			...other
+		} = toProps(index);
+		if (pbrMetallicRoughness) Object.assign(pbrProps, pbrMetallicRoughness);
+		Object.assign(otherProps, other);
+	}
+	const mat = Object.assign(baseMat, otherProps);
+	Object.assign(mat.pbrMetallicRoughness, pbrProps);
+
+	gltf.materials.push(mat);
+	return gltf.materials.length - 1;
+}
 
 /**
  * Build the material-index pipeline for a conversion: one glTF material per
@@ -761,106 +931,31 @@ function packGLB(gltf, binBuffer) {
  * @param {object}   gltf             - The glTF document being built (materials appended).
  * @param {object}   materialsClean   - Material name → channel map.
  * @param {Function} addTextureCached - Texture file name → glTF texture index.
- * @returns {{ materialForGeom: (geom: object) => number }}
+ * @returns {{ resolveMaterial: (geom: object) => number }}
  */
 function buildMaterials(gltf, materialsClean, addTextureCached) {
-	// Source channel → builder for the material property it produces once its
-	// texture resolves (empty object when it doesn't).
-	const streamProps = {
-		base: (i) => ({
-			pbrMetallicRoughness: {
-				baseColorTexture: {
-					index: i
-				}
-			}
-		}),
-		mr: (i) => ({
-			pbrMetallicRoughness: {
-				metallicRoughnessTexture: {
-					index: i
-				}
-			}
-		}),
-		norm: (i) => ({
-			normalTexture: {
-				index: i,
-				scale: 1
-			}
-		}),
-		emit: (i) => ({
-			emissiveTexture: {
-				index: i
-			},
-			emissiveFactor: [1, 1, 1]
-		})
-	};
-
-	// Resolve a channel's texture to a glTF texture index (or -1 when the
-	// channel or its image is absent). Cached per file name by the caller's
-	// addTextureCached, so each image is resolved only once.
-	const resolveTexture = (src) => (src ? addTextureCached(src.cleanFile ?? src.filename) : -1);
-
-	function buildMaterial(name, chans) {
-		const {
-			AlbedoPBR: albedo = null,
-			MetalRough: mr = null,
-			MetalnessPBR = null,
-			NormalMap: norm = null,
-			EmitColor: emit = null
-		} = chans ?? {};
-		const srcByStream = {
-			base: albedo,
-			mr: mr ?? MetalnessPBR,
-			norm,
-			emit
-		};
-
-		const baseMat = {
-			name,
-			pbrMetallicRoughness: {
-				baseColorFactor: [1, 1, 1, 1],
-				metallicFactor: 1,
-				roughnessFactor: 1
-			}
-		};
-		// Gather every resolved texture's property object, then merge in one pass.
-		const propsArray = [];
-		for (const [stream, toProps] of Object.entries(streamProps)) {
-			const index = resolveTexture(srcByStream[stream]);
-			if (index >= 0) propsArray.push(toProps(index));
-		}
-		const mat = propsArray.reduce((acc, props) => ({
-			...acc,
-			...props,
-			pbrMetallicRoughness: {
-				...acc.pbrMetallicRoughness,
-				...(props.pbrMetallicRoughness || {})
-			}
-		}), baseMat);
-
-		gltf.materials.push(mat);
-		return gltf.materials.length - 1;
-	}
+	const resolveTexture = createTextureResolver(addTextureCached);
+	const addMaterial = (name, chans) => buildMaterial(gltf, resolveTexture, name, chans);
 
 	// materialsClean maps material name → channels. Match each geometry to its
 	// material via the StateSet (texture-set uid, then material name), falling
 	// back to the material name appearing in the geometry name.
 	const matNames = Object.keys(materialsClean);
-	const matIndex = Object.fromEntries(
-		matNames.map((n) => [n, buildMaterial(n, materialsClean[n])])
-	);
-	if (!matNames.length) matIndex['__default'] = buildMaterial('material', null);
+	const matIndex = new Map(matNames.map((n) => [n, addMaterial(n, materialsClean[n])]));
+	if (!matNames.length) matIndex.set('__default', addMaterial('material', null));
 
-	const albedoToMat = {};
+	// Precompute the albedo texture-set uid → material index map once.
+	const matIndexByTexSetUid = new Map();
 	for (const [n, ch] of Object.entries(materialsClean))
-		if (ch.AlbedoPBR && ch.AlbedoPBR.setUid) albedoToMat[ch.AlbedoPBR.setUid] = n;
+		if (ch.AlbedoPBR && ch.AlbedoPBR.setUid) matIndexByTexSetUid.set(ch.AlbedoPBR.setUid, matIndex.get(n));
+	const defaultMatIdx = matIndex.values().next().value ?? 0;
 
 	function resolveMaterial(geom) {
-		if (geom.texSetUid && albedoToMat[geom.texSetUid] !== undefined) return matIndex[albedoToMat[geom.texSetUid]];
-		if (geom.matName && matIndex[geom.matName] !== undefined) return matIndex[geom.matName];
+		if (geom.texSetUid && matIndexByTexSetUid.has(geom.texSetUid)) return matIndexByTexSetUid.get(geom.texSetUid);
+		if (geom.matName && matIndex.has(geom.matName)) return matIndex.get(geom.matName);
 		for (const n of matNames)
-			if (n && geom.name && geom.name.indexOf(n) !== -1) return matIndex[n];
-		return Object.values(matIndex)[0] || 0;
+			if (n && geom.name && geom.name.indexOf(n) !== -1) return matIndex.get(n);
+		return defaultMatIdx;
 	}
 
 	return {
@@ -888,7 +983,109 @@ function makeMaterialResolver(resolveMaterial) {
 	};
 }
 
+/**
+ * Create a File-field → binary-buffer resolver that caches by the File string
+ * so the wireframe check runs once per unique descriptor. Returns undefined
+ * when the required buffer was not provided.
+ *
+ * @param {Buffer}      polyBin - Binary geometry buffer (model_file.bin).
+ * @param {Buffer|null} wireBin - Wireframe binary buffer, or null if absent.
+ * @returns {(fileStr: string) => (Buffer|undefined)}
+ */
+function createBinResolver(polyBin, wireBin) {
+	const binByFile = new Map();
+	return (fileStr) => {
+		if (!fileStr) return undefined;
+		let bin = binByFile.get(fileStr);
+		if (bin === undefined) {
+			bin = fileStr.includes('wireframe') ? wireBin : polyBin;
+			binByFile.set(fileStr, bin);
+		}
+		return bin;
+	};
+}
+
 // ─── Exported converter ───────────────────────────────────────────────────────
+
+/**
+ * Validate the converter's required arguments, failing fast with a descriptive
+ * error before any processing begins.
+ */
+function validateInputs(osgjs, polyBin, wireBin, workDir) {
+	if (!osgjs || typeof osgjs !== 'object') throw new Error('convertToGltf: osgjs scene graph is required');
+	if (!polyBin) throw new Error('convertToGltf: polyBin (model_file.bin) is required');
+	if (!workDir) throw new Error('convertToGltf: workDir is required');
+}
+
+/**
+ * Resolve UniqueID references and walk the scene graph, collecting each
+ * geometry's processed mesh record (indices, attributes, material link,
+ * transform).
+ *
+ * @returns {Array} Processed geometry records.
+ */
+function extractGeometries(osgjs, polyBin, wireBin) {
+	const uidMap = {};
+	buildUidMap(osgjs, uidMap);
+	resolveRefs(osgjs, uidMap);
+
+	const geometries = [];
+	// UniqueID → true; a Map leaves room to cache per-geometry state later
+	// without changing how reference handling works.
+	const seen = new Map();
+	const resolveBin = createBinResolver(polyBin, wireBin);
+	traverse(osgjs, IDENTITY, {
+		resolveBin
+	}, seen, geometries);
+	console.log(`  ${geometries.length} geometries found`);
+	return geometries;
+}
+
+/**
+ * Set up the texture cache and material pipeline, returning the per-geometry
+ * material-index resolver.
+ *
+ * @returns {(geom: object) => number}
+ */
+function prepareMaterials(gltf, builder, textureFiles, workDir) {
+	// Build one glTF material per source material (each asteroid has its own atlas).
+	// TextureCache memoizes on the texture file name so repeated references
+	// resolve (and hit the disk) only once.
+	const textureCache = new TextureCache(builder, join(workDir, 'textures'));
+	const addTextureCached = (file) => textureCache.get(file);
+
+	const materialsClean = textureFiles || {};
+	const {
+		resolveMaterial
+	} = buildMaterials(gltf, materialsClean, addTextureCached);
+	return makeMaterialResolver(resolveMaterial);
+}
+
+/**
+ * Append one mesh + node per geometry so each carries its own transform
+ * matrix; otherwise every part (wheels, doors, …) collapses onto the origin.
+ */
+function assembleMeshesAndNodes(gltf, builder, geometries, materialForGeom) {
+	for (const geom of geometries) {
+		const meshIdx = gltf.meshes.push(createMesh(builder, geom, materialForGeom)) - 1;
+		const nodeIdx = gltf.nodes.push(createNode(geom, meshIdx)) - 1;
+		gltf.scenes[0].nodes.push(nodeIdx);
+	}
+}
+
+/**
+ * Concatenate the accumulated binary chunks and pack the finished glTF
+ * document + binary into a GLB buffer.
+ *
+ * @returns {Buffer} Complete GLB file contents.
+ */
+function finalizeGLB(gltf, builder) {
+	const binBuffer = Buffer.concat(builder.chunks);
+	gltf.buffers.push({
+		byteLength: binBuffer.length
+	});
+	return packGLB(gltf, binBuffer);
+}
 
 /**
  * Convert an osgjs scene graph + binary geometry data into a GLB buffer.
@@ -904,61 +1101,12 @@ function makeMaterialResolver(resolveMaterial) {
  * @returns {Buffer} Complete GLB file contents.
  */
 function convertToGltf(osgjs, polyBin, wireBin, textureFiles, workDir) {
+	validateInputs(osgjs, polyBin, wireBin, workDir);
 	console.log(`[5/6] Converting to glTF...`);
-	const uidMap = {};
-	buildUidMap(osgjs, uidMap);
-	resolveRefs(osgjs, uidMap);
 
-	const geometries = [];
-	// UniqueID → true; a Map leaves room to cache per-geometry state later
-	// without changing how reference handling works.
-	const seen = new Map();
+	const geometries = extractGeometries(osgjs, polyBin, wireBin);
 
-	// Cache the binary buffer each File field resolves to, keyed by the File
-	// string itself, so the wireframe check runs once per unique descriptor.
-	// Returns undefined when the required buffer was not provided.
-	const binByFile = new Map();
-	const resolveBin = (fileStr) => {
-		if (!fileStr) return undefined;
-		let bin = binByFile.get(fileStr);
-		if (bin === undefined) {
-			bin = fileStr.includes('wireframe') ? wireBin : polyBin;
-			binByFile.set(fileStr, bin);
-		}
-		return bin;
-	};
-
-	traverse(osgjs, IDENTITY, {
-		resolveBin
-	}, seen, geometries);
-	console.log(`  ${geometries.length} geometries found`);
-
-	// Build GLB
-	const gltf = {
-		asset: {
-			version: '2.0',
-			generator: 'sketchfab-downloader'
-		},
-		scene: 0,
-		scenes: [{
-			nodes: []
-		}],
-		nodes: [],
-		meshes: [],
-		accessors: [],
-		bufferViews: [],
-		buffers: [],
-		materials: [],
-		textures: [],
-		images: [],
-		samplers: [{
-			magFilter: MAG_FILTER,
-			minFilter: MIN_FILTER,
-			wrapS: WRAP_S,
-			wrapT: WRAP_T
-		}]
-	};
-
+	const gltf = buildGltfBase();
 	// GLB builder state shared by the module-level addAccessor/addImage/addTexture
 	// helpers: the glTF document, padded binary chunks, and the running offset.
 	const builder = {
@@ -967,41 +1115,10 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, workDir) {
 		byteOffset: 0
 	};
 
-	// Build one glTF material per source material (each asteroid has its own atlas).
-	// addTextureCached memoizes on the texture file name so repeated references
-	// resolve (and hit the disk) only once.
-	const texDir = join(workDir, 'textures');
-	const texCache = new Map();
+	const materialForGeom = prepareMaterials(gltf, builder, textureFiles, workDir);
+	assembleMeshesAndNodes(gltf, builder, geometries, materialForGeom);
 
-	function addTextureCached(file) {
-		let idx = texCache.get(file);
-		if (idx === undefined) {
-			idx = addTexture(builder, join(texDir, file));
-			texCache.set(file, idx);
-		}
-		return idx;
-	}
-
-	const materialsClean = textureFiles || {};
-	const {
-		resolveMaterial
-	} = buildMaterials(gltf, materialsClean, addTextureCached);
-	const materialForGeom = makeMaterialResolver(resolveMaterial);
-
-	// Each geometry becomes its own mesh + node so it can carry its own transform
-	// matrix; otherwise every part (wheels, doors, …) collapses onto the origin.
-	for (const geom of geometries) {
-		const meshIdx = createMesh(builder, geom, materialForGeom);
-		const nodeIdx = gltf.nodes.push(createNode(geom, meshIdx)) - 1;
-		gltf.scenes[0].nodes.push(nodeIdx);
-	}
-
-	const binBuffer = Buffer.concat(builder.chunks);
-	gltf.buffers.push({
-		byteLength: binBuffer.length
-	});
-
-	return packGLB(gltf, binBuffer);
+	return finalizeGLB(gltf, builder);
 }
 
 export default {
